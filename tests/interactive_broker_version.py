@@ -21,6 +21,11 @@ import sys
 import argparse
 import json
 
+def version_as_number (version):
+    if version == 'trunk':
+        return sys.maxint
+    tokens = version.split('.')
+    return float('%s.%s' % (tokens[0], tokens[1]))
 
 def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt=1,
                   root_path='tmp', broker_cnt=3):
@@ -52,6 +57,9 @@ def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt
 
     brokers = []
     for n in range(0, broker_cnt):
+        # Configure rack & replica selector if broker supports fetch-from-follower
+        if version_as_number(version) >= 2.4:
+            defconf.update({'conf': ['broker.rack=RACK${appid}', 'replica.selector.class=org.apache.kafka.common.replica.RackAwareReplicaSelector']})
         brokers.append(KafkaBrokerApp(cluster, defconf))
 
     cmd_env = os.environ.copy()
@@ -61,10 +69,9 @@ def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt
     fd, test_conf_file = tempfile.mkstemp(prefix='test_conf', text=True)
     os.write(fd, ('test.sql.command=sqlite3 rdktests\n').encode('ascii'))
     os.write(fd, 'broker.address.family=v4\n'.encode('ascii'))
-    if version != 'trunk':
+    if version.startswith('0.9') or version.startswith('0.8'):
+        os.write(fd, 'api.version.request=false\n'.encode('ascii'))
         os.write(fd, ('broker.version.fallback=%s\n' % version).encode('ascii'))
-    else:
-        os.write(fd, 'api.version.request=true\n'.encode('ascii'))
     # SASL (only one mechanism supported)
     mech = defconf.get('sasl_mechanisms', '').split(',')[0]
     if mech != '':
@@ -146,9 +153,16 @@ def test_version (version, cmd=None, deploy=True, conf={}, debug=False, exec_cnt
     cmd_env['BROKERS'] = bootstrap_servers
     cmd_env['TEST_KAFKA_VERSION'] = version
     cmd_env['TRIVUP_ROOT'] = cluster.instance_path()
-    # Add each broker pid as an env so they can be killed indivdidually.
+
+    # Per broker env vars
     for b in [x for x in cluster.apps if isinstance(x, KafkaBrokerApp)]:
+        cmd_env['BROKER_ADDRESS_%d' % b.appid] = b.conf['address']
+        # Add each broker pid as an env so they can be killed indivdidually.
         cmd_env['BROKER_PID_%d' % b.appid] = str(b.proc.pid)
+        # JMX port, if available
+        jmx_port = b.conf.get('jmx_port', None)
+        if jmx_port is not None:
+            cmd_env['BROKER_JMX_PORT_%d' % b.appid] = str(jmx_port)
 
     if not cmd:
         cmd_env['PS1'] = '[TRIVUP:%s@%s] \\u@\\h:\w$ ' % (cluster.name, version)

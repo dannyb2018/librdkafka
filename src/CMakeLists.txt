@@ -7,6 +7,7 @@ set(
     rdavl.c
     rdbuf.c
     rdcrc32.c
+    rdfnv1a.c
     rdkafka.c
     rdkafka_assignor.c
     rdkafka_broker.c
@@ -41,7 +42,13 @@ set(
     rdkafka_aux.c
     rdkafka_background.c
     rdkafka_idempotence.c
+    rdkafka_txnmgr.c
     rdkafka_cert.c
+    rdkafka_coord.c
+    rdkafka_mock.c
+    rdkafka_mock_handlers.c
+    rdkafka_mock_cgrp.c
+    rdkafka_error.c
     rdlist.c
     rdlog.c
     rdmurmur2.c
@@ -54,7 +61,7 @@ set(
     snappy.c
     tinycthread.c
     tinycthread_extra.c
-    xxhash.c
+    rdxxhash.c
 )
 
 if(WITH_SSL)
@@ -170,6 +177,7 @@ endif()
 
 if(WITH_ZLIB)
   find_package(ZLIB REQUIRED)
+  target_include_directories(rdkafka PUBLIC ${ZLIB_INCLUDE_DIRS})
   target_link_libraries(rdkafka PUBLIC ZLIB::ZLIB)
 endif()
 
@@ -189,6 +197,7 @@ if(WITH_SSL)
     add_dependencies(rdkafka bundled-ssl)
   else()
     find_package(OpenSSL REQUIRED)
+    target_include_directories(rdkafka PUBLIC ${OPENSSL_INCLUDE_DIR})
     target_link_libraries(rdkafka PUBLIC OpenSSL::SSL OpenSSL::Crypto)
   endif()
 endif()
@@ -201,6 +210,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(rdkafka PUBLIC Threads::Threads)
 
 if(WITH_SASL_CYRUS)
+  target_include_directories(rdkafka PUBLIC ${SASL_INCLUDE_DIRS})
   target_link_libraries(rdkafka PUBLIC ${SASL_LIBRARIES})
 endif()
 
@@ -209,6 +219,7 @@ if(WITH_LIBDL)
 endif()
 
 if(WITH_LZ4_EXT)
+  target_include_directories(rdkafka PUBLIC ${LZ4_INCLUDE_DIRS})
   target_link_libraries(rdkafka PUBLIC LZ4::LZ4)
 endif()
 
@@ -300,6 +311,6 @@ install(
 )
 
 install(
-    FILES "rdkafka.h"
+    FILES "rdkafka.h" "rdkafka_mock.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/librdkafka"
 )

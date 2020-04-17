@@ -6,13 +6,13 @@ GREEN='\033[32m'
 CYAN='\033[36m'
 CCLR='\033[0m'
 
-if [ -z "$1" ]; then
+if [[ $1 == -h ]]; then
     echo "Usage: $0 [-..] [modes..]"
     echo ""
     echo "  Modes: bare valgrind helgrind drd gdb lldb bash"
     echo "  Options:"
     echo "   -..    - test-runner command arguments (pass thru)"
-    exit 1
+    exit 0
 fi
 
 ARGS=
@@ -24,8 +24,8 @@ done
 
 TEST=./test-runner
 
-if [ ! -z "$2" ]; then
-    MODES=$2
+if [ ! -z "$1" ]; then
+    MODES=$1
 else
     MODES="bare"
     # Enable valgrind:
@@ -77,13 +77,24 @@ for mode in $MODES; do
 		$TEST	$ARGS
 	    RET=$?
 	    ;;
+        callgrind)
+	    valgrind $VALGRIND_ARGS --tool=callgrind $SUPP $GEN_SUPP \
+		$TEST	$ARGS
+	    RET=$?
+	    ;;
         gdb)
-            if [[ -f gdb.run ]]; then
-                gdb -x gdb.run $ARGS $TEST
-            else
-                gdb $ARGS $TEST
-            fi
+            grun=$(mktemp gdbrunXXXXXX.gdb)
+            cat >$grun <<EOF
+set \$_exitcode = -999
+run $ARGS
+if \$_exitcode != -999
+ quit
+end
+EOF
+            export ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=1"
+            gdb -x $grun $TEST
             RET=$?
+            rm $grun
             ;;
 	bare)
 	    $TEST $ARGS

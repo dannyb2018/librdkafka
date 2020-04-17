@@ -63,8 +63,7 @@ rd_kafka_metadata (rd_kafka_t *rk, int all_topics,
         if (!all_topics) {
                 if (only_rkt)
                         rd_list_add(&topics,
-                                    rd_strdup(rd_kafka_topic_a2i(only_rkt)->
-                                              rkt_topic->str));
+                                    rd_strdup(rd_kafka_topic_name(only_rkt)));
                 else
                         rd_kafka_local_topics_to_list(rkb->rkb_rk, &topics);
         }
@@ -247,6 +246,7 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                        0/*dont assert on fail*/);
 
         if (!(md = rd_tmpabuf_alloc(&tbuf, sizeof(*md)))) {
+                rd_kafka_broker_unlock(rkb);
                 err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
                 goto err;
         }
@@ -444,7 +444,7 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                            md->brokers[i].port,
                            md->brokers[i].id);
                 rd_kafka_broker_update(rkb->rkb_rk, rkb->rkb_proto,
-                                       &md->brokers[i]);
+                                       &md->brokers[i], NULL);
         }
 
         /* Update partition count and leader for each topic we know about */
@@ -516,13 +516,13 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
                         rd_rkb_dbg(rkb, TOPIC, "METADATA", "wanted %s",
                                    (char *)(missing_topics->rl_elems[i]));
                 RD_LIST_FOREACH(topic, missing_topics, i) {
-                        shptr_rd_kafka_itopic_t *s_rkt;
+                        rd_kafka_topic_t *rkt;
 
-                        s_rkt = rd_kafka_topic_find(rkb->rkb_rk, topic, 1/*lock*/);
-                        if (s_rkt) {
-                                rd_kafka_topic_metadata_none(
-                                        rd_kafka_topic_s2i(s_rkt));
-                                rd_kafka_topic_destroy0(s_rkt);
+                        rkt = rd_kafka_topic_find(rkb->rkb_rk,
+                                                  topic, 1/*lock*/);
+                        if (rkt) {
+                                rd_kafka_topic_metadata_none(rkt);
+                                rd_kafka_topic_destroy0(rkt);
                         }
                 }
         }
@@ -591,8 +591,11 @@ rd_kafka_parse_Metadata (rd_kafka_broker_t *rkb,
 
         /* Try to acquire a Producer ID from this broker if we
          * don't have one. */
-        if (rd_kafka_is_idempotent(rkb->rkb_rk))
-                rd_kafka_idemp_request_pid(rkb->rkb_rk, rkb, "metadata update");
+        if (rd_kafka_is_idempotent(rkb->rkb_rk)) {
+                rd_kafka_wrlock(rkb->rkb_rk);
+                rd_kafka_idemp_pid_fsm(rkb->rkb_rk);
+                rd_kafka_wrunlock(rkb->rkb_rk);
+        }
 
 done:
         if (missing_topics)
@@ -965,7 +968,7 @@ rd_kafka_metadata_request (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
 
 /**
  * @brief Query timer callback to trigger refresh for topics
- *        that are missing their leaders.
+ *        that have partitions missing their leaders.
  *
  * @locks none
  * @locality rdkafka main thread
@@ -974,14 +977,14 @@ static void rd_kafka_metadata_leader_query_tmr_cb (rd_kafka_timers_t *rkts,
                                                    void *arg) {
         rd_kafka_t *rk = rkts->rkts_rk;
         rd_kafka_timer_t *rtmr = &rk->rk_metadata_cache.rkmc_query_tmr;
-        rd_kafka_itopic_t *rkt;
+        rd_kafka_topic_t *rkt;
         rd_list_t topics;
 
         rd_kafka_wrlock(rk);
         rd_list_init(&topics, rk->rk_topic_cnt, rd_free);
 
         TAILQ_FOREACH(rkt, &rk->rk_topics, rkt_link) {
-                int i, no_leader = 0;
+                int i, require_metadata;
                 rd_kafka_topic_rdlock(rkt);
 
                 if (rkt->rkt_state == RD_KAFKA_TOPIC_S_NOTEXISTS) {
@@ -990,19 +993,18 @@ static void rd_kafka_metadata_leader_query_tmr_cb (rd_kafka_timers_t *rkts,
                         continue;
                 }
 
-                no_leader = rkt->rkt_flags & RD_KAFKA_TOPIC_F_LEADER_UNAVAIL;
+                require_metadata = rkt->rkt_flags & RD_KAFKA_TOPIC_F_LEADER_UNAVAIL;
 
-                /* Check if any partitions are missing their leaders. */
-                for (i = 0 ; !no_leader && i < rkt->rkt_partition_cnt ; i++) {
-                        rd_kafka_toppar_t *rktp =
-                                rd_kafka_toppar_s2i(rkt->rkt_p[i]);
+                /* Check if any partitions are missing brokers. */
+                for (i = 0 ; !require_metadata && i < rkt->rkt_partition_cnt ; i++) {
+                        rd_kafka_toppar_t *rktp = rkt->rkt_p[i];
                         rd_kafka_toppar_lock(rktp);
-                        no_leader = !rktp->rktp_leader &&
-                                !rktp->rktp_next_leader;
+                        require_metadata = !rktp->rktp_broker &&
+                                !rktp->rktp_next_broker;
                         rd_kafka_toppar_unlock(rktp);
                 }
 
-                if (no_leader || rkt->rkt_partition_cnt == 0)
+                if (require_metadata || rkt->rkt_partition_cnt == 0)
                         rd_list_add(&topics, rd_strdup(rkt->rkt_topic->str));
 
                 rd_kafka_topic_rdunlock(rkt);
@@ -1050,7 +1052,8 @@ void rd_kafka_metadata_fast_leader_query (rd_kafka_t *rk) {
                                    &rk->rk_metadata_cache.rkmc_query_tmr,
                                    1/*lock*/);
         if (next == -1 /* not started */ ||
-            next > rk->rk_conf.metadata_refresh_fast_interval_ms*1000) {
+            next >
+            (rd_ts_t)rk->rk_conf.metadata_refresh_fast_interval_ms * 1000) {
                 rd_kafka_dbg(rk, METADATA|RD_KAFKA_DBG_TOPIC, "FASTQUERY",
                              "Starting fast leader query");
                 rd_kafka_timer_start(&rk->rk_timers,

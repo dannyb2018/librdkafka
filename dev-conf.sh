@@ -69,6 +69,9 @@ case "$1" in
         # so use the builtin tinycthreads instead.
         OPTS="$OPTS --disable-c11threads"
         ;;
+    ubsan)
+        FSAN='-fsanitize=undefined -fsanitize-undefined-trap-on-error -fno-omit-frame-pointer'
+        ;;
     "")
         ;;
     *)
@@ -78,17 +81,11 @@ case "$1" in
 esac
 
 
+export CFLAGS="-Wshadow=compatible-local -Wshadow=local"
+
 # enable pedantic
 #export CFLAGS='-std=c99 -pedantic -Wshadow'
 #export CXXFLAGS='-std=c++98 -pedantic'
-
-if [[ -z $FSAN ]]; then
-    # enable FSAN address, thread, ..
-    #FSAN="-fsanitize=address"
-    #FSAN="-fsanitize=thread"
-    #FSAN="-fsanitize=undefined -fsanitize-undefined-trap-on-error -fno-omit-frame-pointer"
-    true  # block can't be empty
-fi
 
 if [[ ! -z $FSAN ]]; then
     export CPPFLAGS="$CPPFLAGS $FSAN"
@@ -110,11 +107,8 @@ OPTS="$OPTS --disable-optimization"
 # disable cyrus-sasl
 #OPTS="$OPTS --disable-sasl"
 
-# enable sharedptr debugging
-#OPTS="$OPTS --enable-sharedptr-debug"
-
 #enable refcnt debugging
 #OPTS="$OPTS --enable-refcnt-debug"
 
-build Development $OPTS
+build Development "$OPTS"
 
