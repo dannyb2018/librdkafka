@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # NuGet packaging script.
 # Assembles a NuGet package using CI artifacts in S3
@@ -27,6 +27,7 @@ else:
 # Rename token values
 rename_vals = {'plat': {'windows': 'win'},
                'arch': {'x86_64': 'x64',
+                        'amd64': 'x64',
                         'i386': 'x86',
                         'win32': 'x86'}}
 
@@ -51,6 +52,10 @@ rename_vals = {'plat': {'windows': 'win'},
 #
 # Example:
 #   librdkafka/p-librdkafka__bld-travis__plat-linux__arch-x64__tag-v0.0.62__sha-d051b2c19eb0c118991cd8bc5cf86d8e5e446cde__bid-1562.1/librdkafka.tar.gz
+
+
+class MissingArtifactError(Exception):
+    pass
 
 
 s3_bucket = 'librdkafka-ci-packages'
@@ -331,14 +336,16 @@ class NugetPackage (Package):
 
             # Travis OSX build
             [{'arch': 'x64', 'plat': 'osx', 'fname_glob': 'librdkafka-clang.tar.gz'}, './lib/librdkafka.dylib', 'runtimes/osx-x64/native/librdkafka.dylib'],
-            # Travis Debian 9 / Ubuntu 16.04 build
-            [{'arch': 'x64', 'plat': 'linux', 'fname_glob': 'librdkafka-debian9.tgz'}, './lib/librdkafka.so.1', 'runtimes/linux-x64/native/debian9-librdkafka.so'],
+            # Travis Manylinux build
+            [{'arch': 'x64', 'plat': 'linux', 'fname_glob': 'librdkafka-manylinux*x86_64.tgz'}, './lib/librdkafka.so.1', 'runtimes/linux-x64/native/centos6-librdkafka.so'],
             # Travis Ubuntu 14.04 build
             [{'arch': 'x64', 'plat': 'linux', 'fname_glob': 'librdkafka-gcc.tar.gz'}, './lib/librdkafka.so.1', 'runtimes/linux-x64/native/librdkafka.so'],
             # Travis CentOS 7 RPM build
-            [{'arch': 'x64', 'plat': 'linux', 'fname_glob': 'librdkafka1*.x86_64.rpm'}, './usr/lib64/librdkafka.so.1', 'runtimes/linux-x64/native/centos7-librdkafka.so'],
-            # Alpine build
+            [{'arch': 'x64', 'plat': 'linux', 'fname_glob': 'librdkafka1*el7.x86_64.rpm'}, './usr/lib64/librdkafka.so.1', 'runtimes/linux-x64/native/centos7-librdkafka.so'],
+            # Travis Alpine build
             [{'arch': 'x64', 'plat': 'linux', 'fname_glob': 'alpine-librdkafka.tgz'}, 'librdkafka.so.1', 'runtimes/linux-x64/native/alpine-librdkafka.so'],
+            # Travis arm64 Linux build
+            [{'arch': 'arm64', 'plat': 'linux', 'fname_glob': 'librdkafka-gcc.tar.gz'}, './lib/librdkafka.so.1', 'runtimes/linux-arm64/native/librdkafka.so'],
 
             # Common Win runtime
             [{'arch': 'x64', 'plat': 'win', 'fname_glob': 'msvcr120.zip'}, 'msvcr120.dll', 'runtimes/win-x64/native/msvcr120.dll'],
@@ -400,7 +407,7 @@ class NugetPackage (Package):
                     break
 
             if artifact is None:
-                raise Exception('unable to find artifact with tags %s matching "%s"' % (str(attributes), fname_glob))
+                raise MissingArtifactError('unable to find artifact with tags %s matching "%s"' % (str(attributes), fname_glob))
 
             outf = os.path.join(self.stpath, m[2])
             member = m[1]
@@ -435,9 +442,10 @@ class NugetPackage (Package):
             "build/native/lib/win/x86/win-x86-Release/v120/librdkafka.lib",
             "build/native/lib/win/x86/win-x86-Release/v120/librdkafkacpp.lib",
             "runtimes/linux-x64/native/centos7-librdkafka.so",
-            "runtimes/linux-x64/native/debian9-librdkafka.so",
+            "runtimes/linux-x64/native/centos6-librdkafka.so",
             "runtimes/linux-x64/native/alpine-librdkafka.so",
             "runtimes/linux-x64/native/librdkafka.so",
+            "runtimes/linux-arm64/native/librdkafka.so",
             "runtimes/osx-x64/native/librdkafka.dylib",
             "runtimes/win-x64/native/librdkafka.dll",
             "runtimes/win-x64/native/librdkafkacpp.dll",
@@ -504,6 +512,10 @@ class StaticPackage (Package):
             # osx static lib and pkg-config file
             [{'arch': 'x64', 'plat': 'osx', 'fname_glob': 'librdkafka-clang.tar.gz'}, './lib/librdkafka-static.a', 'librdkafka_darwin.a'],
             [{'arch': 'x64', 'plat': 'osx', 'fname_glob': 'librdkafka-clang.tar.gz'}, './lib/pkgconfig/rdkafka-static.pc', 'librdkafka_darwin.pc'],
+
+            # win static lib and pkg-config file (mingw)
+            [{'arch': 'x64', 'plat': 'win', 'fname_glob': 'librdkafka-gcc.tar.gz'}, './lib/librdkafka-static.a', 'librdkafka_windows.a'],
+            [{'arch': 'x64', 'plat': 'win', 'fname_glob': 'librdkafka-gcc.tar.gz'}, './lib/pkgconfig/rdkafka-static.pc', 'librdkafka_windows.pc'],
         ]
 
         for m in mappings:
@@ -538,7 +550,7 @@ class StaticPackage (Package):
                     break
 
             if artifact is None:
-                raise Exception('unable to find artifact with tags %s matching "%s"' % (str(attributes), fname_glob))
+                raise MissingArtifactError('unable to find artifact with tags %s matching "%s"' % (str(attributes), fname_glob))
 
             outf = os.path.join(self.stpath, m[2])
             member = m[1]
@@ -569,7 +581,9 @@ class StaticPackage (Package):
             "./librdkafka_musl_linux.a",
             "./librdkafka_musl_linux.pc",
             "./librdkafka_darwin.a",
-            "./librdkafka_darwin.pc"]
+            "./librdkafka_darwin.pc",
+            "./librdkafka_windows.a",
+            "./librdkafka_windows.pc"]
 
         missing = list()
         with zfile.ZFile(path, 'r') as zf:

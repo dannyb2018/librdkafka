@@ -29,6 +29,7 @@
 #include "rdkafka_int.h"
 #include "rdkafka_buf.h"
 #include "rdkafka_broker.h"
+#include "rdkafka_interceptor.h"
 
 void rd_kafka_buf_destroy_final (rd_kafka_buf_t *rkbuf) {
 
@@ -119,13 +120,19 @@ rd_kafka_buf_t *rd_kafka_buf_new0 (int segcnt, size_t size, int flags) {
  * @brief Create new request buffer with the request-header written (will
  *        need to be updated with Length, etc, later)
  */
-rd_kafka_buf_t *rd_kafka_buf_new_request (rd_kafka_broker_t *rkb, int16_t ApiKey,
-                                          int segcnt, size_t size) {
+rd_kafka_buf_t *rd_kafka_buf_new_request0 (rd_kafka_broker_t *rkb,
+                                           int16_t ApiKey,
+                                           int segcnt, size_t size,
+                                           rd_bool_t is_flexver) {
         rd_kafka_buf_t *rkbuf;
 
         /* Make room for common protocol request headers */
         size += RD_KAFKAP_REQHDR_SIZE +
-                RD_KAFKAP_STR_SIZE(rkb->rkb_rk->rk_client_id);
+                RD_KAFKAP_STR_SIZE(rkb->rkb_rk->rk_client_id) +
+                /* Flexible version adds a tag list to the headers
+                 * and to the end of the payload, both of which we send
+                 * as empty (1 byte each). */
+                (is_flexver ? 1 + 1 : 0);
         segcnt += 1; /* headers */
 
         rkbuf = rd_kafka_buf_new0(segcnt, size, 0);
@@ -134,7 +141,7 @@ rd_kafka_buf_t *rd_kafka_buf_new_request (rd_kafka_broker_t *rkb, int16_t ApiKey
         rd_kafka_broker_keep(rkb);
 
         rkbuf->rkbuf_rel_timeout = rkb->rkb_rk->rk_conf.socket_timeout_ms;
-        rkbuf->rkbuf_max_retries = rkb->rkb_rk->rk_conf.max_retries;
+        rkbuf->rkbuf_max_retries = RD_KAFKA_REQUEST_DEFAULT_RETRIES;
 
         rkbuf->rkbuf_reqhdr.ApiKey = ApiKey;
 
@@ -148,8 +155,17 @@ rd_kafka_buf_t *rd_kafka_buf_new_request (rd_kafka_broker_t *rkb, int16_t ApiKey
         /* CorrId: updated later */
         rd_kafka_buf_write_i32(rkbuf, 0);
 
-        /* ClientId: possibly updated later if a flexible version */
+        /* ClientId */
         rd_kafka_buf_write_kstr(rkbuf, rkb->rkb_rk->rk_client_id);
+
+        if (is_flexver) {
+                /* Must set flexver after writing the client id since
+                 * it is still a standard non-compact string. */
+                rkbuf->rkbuf_flags |= RD_KAFKA_OP_F_FLEXVER;
+
+                /* Empty request header tags */
+                rd_kafka_buf_write_i8(rkbuf, 0);
+        }
 
         return rkbuf;
 }
@@ -381,6 +397,7 @@ int rd_kafka_buf_retry (rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf) {
  */
 void rd_kafka_buf_handle_op (rd_kafka_op_t *rko, rd_kafka_resp_err_t err) {
         rd_kafka_buf_t *request, *response;
+        rd_kafka_t *rk;
 
         request = rko->rko_u.xbuf.rkbuf;
         rko->rko_u.xbuf.rkbuf = NULL;
@@ -407,9 +424,12 @@ void rd_kafka_buf_handle_op (rd_kafka_op_t *rko, rd_kafka_resp_err_t err) {
         response = request->rkbuf_response; /* May be NULL */
         request->rkbuf_response = NULL;
 
-        rd_kafka_buf_callback(request->rkbuf_rkb->rkb_rk,
-			      request->rkbuf_rkb, err,
-                              response, request);
+        if (!(rk = rko->rko_rk)) {
+                rd_assert(request->rkbuf_rkb != NULL);
+                rk = request->rkbuf_rkb->rkb_rk;
+        }
+
+        rd_kafka_buf_callback(rk, request->rkbuf_rkb, err, response, request);
 }
 
 
@@ -431,6 +451,17 @@ void rd_kafka_buf_callback (rd_kafka_t *rk,
 			    rd_kafka_broker_t *rkb, rd_kafka_resp_err_t err,
                             rd_kafka_buf_t *response, rd_kafka_buf_t *request){
 
+        rd_kafka_interceptors_on_response_received(
+                rk,
+                -1,
+                rkb ? rd_kafka_broker_name(rkb) : "",
+                rkb ? rd_kafka_broker_id(rkb) : -1,
+                request->rkbuf_reqhdr.ApiKey,
+                request->rkbuf_reqhdr.ApiVersion,
+                request->rkbuf_reshdr.CorrId,
+                response ? response->rkbuf_totlen : 0,
+                response ? response->rkbuf_ts_sent : -1,
+                err);
 
         if (err != RD_KAFKA_RESP_ERR__DESTROY && request->rkbuf_replyq.q) {
                 rd_kafka_op_t *rko = rd_kafka_op_new(RD_KAFKA_OP_RECV_BUF);

@@ -5,10 +5,10 @@ CHECK_FILES+=	CONFIGURATION.md \
 		examples/rdkafka_example_cpp
 
 DOC_FILES+=	LICENSE LICENSES.txt INTRODUCTION.md README.md \
-		CONFIGURATION.md STATISTICS.md
+		CONFIGURATION.md STATISTICS.md CHANGELOG.md
 
 PKGNAME?=	librdkafka
-VERSION?=	$(shell python packaging/get_version.py src/rdkafka.h)
+VERSION?=	$(shell python3 packaging/get_version.py src/rdkafka.h)
 
 # Jenkins CI integration
 BUILD_NUMBER ?= 1
@@ -19,7 +19,7 @@ MKL_COPYRIGHT_SKIP?=^(tests|packaging)
 
 .PHONY:
 
-all: mklove-check libs CONFIGURATION.md check
+all: mklove-check libs CONFIGURATION.md check TAGS
 
 include mklove/Makefile.base
 
@@ -33,7 +33,7 @@ CONFIGURATION.md: src/rdkafka.h examples
 		sed 's/||/\\|\\|/g' >> \
 		CONFIGURATION.md.tmp; \
 		cmp CONFIGURATION.md CONFIGURATION.md.tmp || \
-		mv CONFIGURATION.md.tmp CONFIGURATION.md; \
+		mv -f CONFIGURATION.md.tmp CONFIGURATION.md; \
 		rm -f CONFIGURATION.md.tmp)
 
 file-check: CONFIGURATION.md LICENSES.txt examples
@@ -80,8 +80,21 @@ rpm: distclean
 
 LICENSES.txt: .PHONY
 	@(for i in LICENSE LICENSE.*[^~] ; do (echo "$$i" ; echo "--------------------------------------------------------------" ; cat $$i ; echo "" ; echo "") ; done) > $@.tmp
-	@cmp $@ $@.tmp || mv $@.tmp $@ ; rm -f $@.tmp
+	@cmp $@ $@.tmp || mv -f $@.tmp $@ ; rm -f $@.tmp
 
+
+TAGS: .PHONY
+	@(if which etags >/dev/null 2>&1 ; then \
+		echo "Using etags to generate $@" ; \
+		git ls-tree -r --name-only HEAD | egrep '\.(c|cpp|h)$$' | \
+			etags -f $@.tmp - ; \
+		cmp $@ $@.tmp || mv $@.tmp $@ ; rm -f $@.tmp ; \
+	 elif which ctags >/dev/null 2>&1 ; then \
+		echo "Using ctags to generate $@" ; \
+		git ls-tree -r --name-only HEAD | egrep '\.(c|cpp|h)$$' | \
+			ctags -e -f $@.tmp -L- ; \
+		cmp $@ $@.tmp || mv $@.tmp $@ ; rm -f $@.tmp ; \
+	fi)
 
 coverity: Makefile.config
 	@(which cov-build >/dev/null 2>&1 || echo "Make sure coverity../bin is in your PATH")

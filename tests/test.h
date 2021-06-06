@@ -33,7 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#ifndef _MSC_VER
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 #include <errno.h>
@@ -56,8 +56,7 @@
 #endif
 
 #include "testshared.h"
-
-#ifdef _MSC_VER
+#ifdef _WIN32
 #define sscanf(...) sscanf_s(__VA_ARGS__)
 #endif
 
@@ -65,7 +64,6 @@
  * Test output is controlled through "TEST_LEVEL=N" environemnt variable.
  * N < 2: TEST_SAY() is quiet.
  */
-extern int test_level;
 
 extern int test_seed;
 extern char test_mode[64];
@@ -85,6 +83,10 @@ extern mtx_t test_mtx;
 
 #define TEST_LOCK()   mtx_lock(&test_mtx)
 #define TEST_UNLOCK() mtx_unlock(&test_mtx)
+
+
+/* Forward decl */
+typedef struct test_msgver_s test_msgver_t;
 
 
 /** @struct Resource usage thresholds */
@@ -122,6 +124,8 @@ struct test {
 
 	const char *extra;   /**< Extra information to print in test_summary. */
 
+        const char *scenario; /**< Test scenario */
+
 	char **report_arr;   /**< Test-specific reporting, JSON array of objects. */
 	int report_cnt;
 	int report_size;
@@ -132,6 +136,9 @@ struct test {
                                               *   or -1 for not checking. */
         int produce_sync;    /**< test_produce_sync() call in action */
         rd_kafka_resp_err_t produce_sync_err;  /**< DR error */
+        test_msgver_t *dr_mv; /**< MsgVer that delivered messages will be
+                               *   added to (if not NULL).
+                               *   Must be set and freed by test. */
 
         /**
          * Runtime
@@ -143,7 +150,9 @@ struct test {
 	int64_t timeout;
         test_state_t state;
         int     failcnt;     /**< Number of failures, useful with FAIL_LATER */
-        char    failstr[512];/**< First test failure reason */
+        char    failstr[512+1];/**< First test failure reason */
+        char    subtest[400];/**< Current subtest, if any */
+        test_timing_t subtest_duration; /**< Subtest duration timing */
 
 #if WITH_SOCKEM
         rd_list_t sockets;
@@ -160,7 +169,7 @@ struct test {
 };
 
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 #define TEST_F_KNOWN_ISSUE_WIN32  TEST_F_KNOWN_ISSUE
 #else
 #define TEST_F_KNOWN_ISSUE_WIN32 0
@@ -271,12 +280,13 @@ static RD_INLINE int jitter (int low, int high) {
  *   - messages received in order
  *   - EOF
  */
-typedef struct test_msgver_s {
+struct test_msgver_s {
 	struct test_mv_p **p;  /* Partitions array */
 	int p_cnt;             /* Partition count */
 	int p_size;            /* p size */
 	int msgcnt;            /* Total message count */
 	uint64_t testid;       /* Only accept messages for this testid */
+        rd_bool_t ignore_eof;  /* Don't end PARTITION_EOF messages */
 
 	struct test_msgver_s *fwd;  /* Also forward add_msg() to this mv */
 
@@ -286,13 +296,14 @@ typedef struct test_msgver_s {
 
         const char *msgid_hdr; /**< msgid string is in header by this name,
                                 * rather than in the payload (default). */
-} test_msgver_t;
+}; /* test_msgver_t; */
 
 /* Message */
 struct test_mv_m {
         int64_t offset;    /* Message offset */
         int     msgid;     /* Message id */
         int64_t timestamp; /* Message timestamp */
+        int32_t broker_id; /* Message broker id */
 };
 
 
@@ -322,23 +333,28 @@ struct test_mv_vs {
         int64_t timestamp_min;
         int64_t timestamp_max;
 
+        /* used by verify_broker_id */
+        int32_t broker_id;
+
 	struct test_mv_mvec mvec;
 
         /* Correct msgver for comparison */
         test_msgver_t *corr;
-} vs;
+};
 
 
 void test_msgver_init (test_msgver_t *mv, uint64_t testid);
 void test_msgver_clear (test_msgver_t *mv);
+void test_msgver_ignore_eof (test_msgver_t *mv);
 int test_msgver_add_msg00 (const char *func, int line, const char *clientname,
                            test_msgver_t *mv,
                            uint64_t testid,
                            const char *topic, int32_t partition,
-                           int64_t offset, int64_t timestamp,
+                           int64_t offset, int64_t timestamp, int32_t broker_id,
                            rd_kafka_resp_err_t err, int msgnum);
 int test_msgver_add_msg0 (const char *func, int line, const char *clientname,
-                          test_msgver_t *mv, rd_kafka_message_t *rkm,
+                          test_msgver_t *mv,
+                          const rd_kafka_message_t *rkmessage,
                           const char *override_topic);
 #define test_msgver_add_msg(rk,mv,rkm)                          \
         test_msgver_add_msg0(__FUNCTION__,__LINE__,             \
@@ -356,6 +372,7 @@ int test_msgver_add_msg0 (const char *func, int line, const char *clientname,
 #define TEST_MSGVER_BY_MSGID  0x10000 /* Verify by msgid (unique in testid) */
 #define TEST_MSGVER_BY_OFFSET 0x20000 /* Verify by offset (unique in partition)*/
 #define TEST_MSGVER_BY_TIMESTAMP 0x40000 /* Verify by timestamp range */
+#define TEST_MSGVER_BY_BROKER_ID 0x80000 /* Verify by broker id */
 
 #define TEST_MSGVER_SUBSET 0x100000  /* verify_compare: allow correct mv to be
                                       * a subset of mv. */
@@ -435,9 +452,15 @@ void test_produce_msgs_rate (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 rd_kafka_resp_err_t test_produce_sync (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                                        uint64_t testid, int32_t partition);
 
-void test_produce_msgs_easy_v (const char *topic, int32_t partition,
-                               uint64_t testid,
+void test_produce_msgs_easy_v (const char *topic, uint64_t testid,
+                               int32_t partition,
                                int msg_base, int cnt, size_t size, ...);
+void test_produce_msgs_easy_multi (uint64_t testid, ...);
+
+void test_rebalance_cb (rd_kafka_t *rk,
+                        rd_kafka_resp_err_t err,
+                        rd_kafka_topic_partition_list_t *parts,
+                        void *opaque);
 
 rd_kafka_t *test_create_consumer (const char *group_id,
 				  void (*rebalance_cb) (
@@ -503,17 +526,35 @@ void test_consumer_poll_no_msgs (const char *what, rd_kafka_t *rk,
 void test_consumer_poll_expect_err (rd_kafka_t *rk, uint64_t testid,
                                     int timeout_ms, rd_kafka_resp_err_t err);
 int test_consumer_poll_once (rd_kafka_t *rk, test_msgver_t *mv, int timeout_ms);
+int test_consumer_poll_exact (const char *what, rd_kafka_t *rk, uint64_t testid,
+                              int exp_eof_cnt, int exp_msg_base, int exp_cnt,
+                              rd_bool_t exact, test_msgver_t *mv);
 int test_consumer_poll (const char *what, rd_kafka_t *rk, uint64_t testid,
                         int exp_eof_cnt, int exp_msg_base, int exp_cnt,
 			test_msgver_t *mv);
 
-void test_consumer_wait_assignment (rd_kafka_t *rk);
+void test_consumer_wait_assignment (rd_kafka_t *rk, rd_bool_t do_poll);
+void test_consumer_verify_assignment0 (const char *func, int line,
+                                       rd_kafka_t *rk,
+                                       int fail_immediately, ...);
+#define test_consumer_verify_assignment(rk,fail_immediately,...)        \
+        test_consumer_verify_assignment0(__FUNCTION__,__LINE__,rk,      \
+                                         fail_immediately,__VA_ARGS__)
+
 void test_consumer_assign (const char *what, rd_kafka_t *rk,
-			   rd_kafka_topic_partition_list_t *parts);
+                           rd_kafka_topic_partition_list_t *parts);
+void test_consumer_incremental_assign (const char *what, rd_kafka_t *rk,
+                                       rd_kafka_topic_partition_list_t *parts);
 void test_consumer_unassign (const char *what, rd_kafka_t *rk);
+void test_consumer_incremental_unassign (const char *what, rd_kafka_t *rk,
+                                         rd_kafka_topic_partition_list_t
+                                         *parts);
 void test_consumer_assign_partition (const char *what, rd_kafka_t *rk,
                                      const char *topic, int32_t partition,
                                      int64_t offset);
+void test_consumer_pause_resume_partition (rd_kafka_t *rk,
+                                           const char *topic, int32_t partition,
+                                           rd_bool_t pause);
 
 void test_consumer_close (rd_kafka_t *rk);
 
@@ -521,6 +562,8 @@ void test_flush (rd_kafka_t *rk, int timeout_ms);
 
 void test_conf_set (rd_kafka_conf_t *conf, const char *name, const char *val);
 char *test_conf_get (const rd_kafka_conf_t *conf, const char *name);
+char *test_topic_conf_get (const rd_kafka_topic_conf_t *tconf,
+                           const char *name);
 int test_conf_match (rd_kafka_conf_t *conf, const char *name, const char *val);
 void test_topic_conf_set (rd_kafka_topic_conf_t *tconf,
                           const char *name, const char *val);
@@ -530,6 +573,8 @@ void test_any_conf_set (rd_kafka_conf_t *conf,
 
 void test_print_partition_list (const rd_kafka_topic_partition_list_t
 				*partitions);
+int test_partition_list_cmp (rd_kafka_topic_partition_list_t *al,
+                             rd_kafka_topic_partition_list_t *bl);
 
 void test_kafka_topics (const char *fmt, ...);
 void test_create_topic (rd_kafka_t *use_rk,
@@ -616,12 +661,37 @@ test_AlterConfigs_simple (rd_kafka_t *rk,
                           const char *resname,
                           const char **configs, size_t config_cnt);
 
+rd_kafka_resp_err_t
+test_DeleteGroups_simple (rd_kafka_t *rk,
+                          rd_kafka_queue_t *useq,
+                          char **groups, size_t group_cnt,
+                          void *opaque);
+
+rd_kafka_resp_err_t
+test_DeleteRecords_simple (rd_kafka_t *rk,
+                           rd_kafka_queue_t *useq,
+                           const rd_kafka_topic_partition_list_t *offsets,
+                           void *opaque);
+
+rd_kafka_resp_err_t
+test_DeleteConsumerGroupOffsets_simple (
+        rd_kafka_t *rk,
+        rd_kafka_queue_t *useq,
+        const char *group_id,
+        const rd_kafka_topic_partition_list_t *offsets,
+        void *opaque);
+
 rd_kafka_resp_err_t test_delete_all_test_topics (int timeout_ms);
 
 
 void test_mock_cluster_destroy (rd_kafka_mock_cluster_t *mcluster);
 rd_kafka_mock_cluster_t *test_mock_cluster_new (int broker_cnt,
                                                 const char **bootstraps);
+
+
+
+int test_error_is_not_fatal_cb (rd_kafka_t *rk, rd_kafka_resp_err_t err,
+                                const char *reason);
 
 
 /**
@@ -666,6 +736,50 @@ rd_kafka_mock_cluster_t *test_mock_cluster_new (int broker_cnt,
                 break;                                                  \
         TEST_FAIL("%s failed: %s\n",                                    \
                   _desc, rd_kafka_error_string(_error));                \
+        } while (0)
+
+/**
+ * @brief Same as TEST_CALL__() but expects an rd_kafka_resp_err_t return type
+ *        without errstr.
+ */
+#define TEST_CALL_ERR__(FUNC_W_ARGS) do {                               \
+        test_timing_t _timing;                                          \
+        const char *_desc = RD_STRINGIFY(FUNC_W_ARGS);                  \
+        rd_kafka_resp_err_t _err;                                       \
+        TIMING_START(&_timing, "%s", _desc);                            \
+        TEST_SAYL(3, "Begin call %s\n", _desc);                         \
+        _err = FUNC_W_ARGS;                                             \
+        TIMING_STOP(&_timing);                                          \
+        if (!_err)                                                      \
+                break;                                                  \
+        TEST_FAIL("%s failed: %s\n",                                    \
+                  _desc, rd_kafka_err2str(_err));                       \
+        } while (0)
+
+
+/**
+ * @brief Print a rich error_t object in all its glory. NULL is ok.
+ *
+ * @param ... Is a prefix format-string+args that is printed with TEST_SAY()
+ *            prior to the error details. E.g., "commit() returned: ".
+ *            A newline is automatically appended.
+ */
+#define TEST_SAY_ERROR(ERROR,...) do {                   \
+        rd_kafka_error_t *_e = (ERROR);                  \
+        TEST_SAY(__VA_ARGS__);                           \
+        if (!_e) {                                       \
+                TEST_SAY0("No error" _C_CLR "\n");       \
+                break;                                   \
+        }                                                \
+        if (rd_kafka_error_is_fatal(_e))                 \
+                TEST_SAY0(_C_RED "FATAL ");              \
+        if (rd_kafka_error_is_retriable(_e))             \
+                TEST_SAY0("Retriable ");                 \
+        if (rd_kafka_error_txn_requires_abort(_e))       \
+                TEST_SAY0("TxnRequiresAbort ");          \
+        TEST_SAY0("Error: %s: %s" _C_CLR "\n",           \
+                  rd_kafka_error_name(_e),               \
+                  rd_kafka_error_string(_e));            \
         } while (0)
 
 /**

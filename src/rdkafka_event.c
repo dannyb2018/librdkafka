@@ -63,6 +63,12 @@ const char *rd_kafka_event_name (const rd_kafka_event_t *rkev) {
                 return "AlterConfigsResult";
         case RD_KAFKA_EVENT_DESCRIBECONFIGS_RESULT:
                 return "DescribeConfigsResult";
+        case RD_KAFKA_EVENT_DELETERECORDS_RESULT:
+                return "DeleteRecordsResult";
+        case RD_KAFKA_EVENT_DELETEGROUPS_RESULT:
+                return "DeleteGroupsResult";
+        case RD_KAFKA_EVENT_DELETECONSUMERGROUPOFFSETS_RESULT:
+                return "DeleteConsumerGroupOffsetsResult";
         case RD_KAFKA_EVENT_OAUTHBEARER_TOKEN_REFRESH:
                 return "SaslOAuthBearerTokenRefresh";
 	default:
@@ -224,6 +230,34 @@ int rd_kafka_event_log (rd_kafka_event_t *rkev, const char **fac,
 	return 0;
 }
 
+int rd_kafka_event_debug_contexts (rd_kafka_event_t *rkev,
+            char *dst, size_t dstsize) {
+        static const char *names[] = {
+                "generic",
+                "broker",
+                "topic",
+                "metadata",
+                "feature",
+                "queue",
+                "msg",
+                "protocol",
+                "cgrp",
+                "security",
+                "fetch",
+                "interceptor",
+                "plugin",
+                "consumer",
+                "admin",
+                "eos",
+                "mock",
+                NULL
+        };
+        if (unlikely(rkev->rko_evtype != RD_KAFKA_EVENT_LOG))
+                return -1;
+        rd_flags2str(dst, dstsize, names, rkev->rko_u.log.ctx);
+        return 0;
+}
+
 const char *rd_kafka_event_stats (rd_kafka_event_t *rkev) {
 	return rkev->rko_u.stats.json;
 }
@@ -311,4 +345,31 @@ rd_kafka_event_DescribeConfigs_result (rd_kafka_event_t *rkev) {
                 return NULL;
         else
                 return (const rd_kafka_DescribeConfigs_result_t *)rkev;
+}
+
+const rd_kafka_DeleteRecords_result_t *
+rd_kafka_event_DeleteRecords_result (rd_kafka_event_t *rkev) {
+        if (!rkev || rkev->rko_evtype != RD_KAFKA_EVENT_DELETERECORDS_RESULT)
+                return NULL;
+        else
+                return (const rd_kafka_DeleteRecords_result_t *)rkev;
+}
+
+const rd_kafka_DeleteGroups_result_t *
+rd_kafka_event_DeleteGroups_result (rd_kafka_event_t *rkev) {
+        if (!rkev || rkev->rko_evtype != RD_KAFKA_EVENT_DELETEGROUPS_RESULT)
+                return NULL;
+        else
+                return (const rd_kafka_DeleteGroups_result_t *)rkev;
+}
+
+const rd_kafka_DeleteConsumerGroupOffsets_result_t *
+rd_kafka_event_DeleteConsumerGroupOffsets_result (rd_kafka_event_t *rkev) {
+        if (!rkev ||
+            rkev->rko_evtype !=
+            RD_KAFKA_EVENT_DELETECONSUMERGROUPOFFSETS_RESULT)
+                return NULL;
+        else
+                return (const rd_kafka_DeleteConsumerGroupOffsets_result_t *)
+                        rkev;
 }

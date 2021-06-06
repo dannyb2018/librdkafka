@@ -74,7 +74,8 @@ void rd_kafka_idemp_pid_update (rd_kafka_broker_t *rkb,
                                 const rd_kafka_pid_t pid);
 void rd_kafka_idemp_pid_fsm (rd_kafka_t *rk);
 void rd_kafka_idemp_drain_reset (rd_kafka_t *rk, const char *reason);
-void rd_kafka_idemp_drain_epoch_bump (rd_kafka_t *rk, const char *fmt, ...);
+void rd_kafka_idemp_drain_epoch_bump (rd_kafka_t *rk, const char *fmt, ...)
+        RD_FORMAT(printf, 2, 3);
 void rd_kafka_idemp_drain_toppar (rd_kafka_toppar_t *rktp, const char *reason);
 void rd_kafka_idemp_inflight_toppar_sub (rd_kafka_t *rk,
                                          rd_kafka_toppar_t *rktp);
@@ -88,7 +89,8 @@ rd_kafka_idemp_broker_any (rd_kafka_t *rk,
 
 rd_bool_t rd_kafka_idemp_check_error (rd_kafka_t *rk,
                                       rd_kafka_resp_err_t err,
-                                      const char *errstr);
+                                      const char *errstr,
+                                      rd_bool_t is_fatal);
 
 
 /**
@@ -100,6 +102,10 @@ rd_bool_t rd_kafka_idemp_check_error (rd_kafka_t *rk,
  * If the producer is not transactional the client instance fatal error
  * is set and the producer instance is no longer usable.
  *
+ * @Warning Until KIP-360 has been fully implemented any fatal idempotent
+ *          producer error will also raise a fatal transactional producer error.
+ *          This is to guarantee that there is no silent data loss.
+ *
  * @param RK rd_kafka_t instance
  * @param ERR error to raise
  * @param ... format string with error message
@@ -109,8 +115,8 @@ rd_bool_t rd_kafka_idemp_check_error (rd_kafka_t *rk,
  */
 #define rd_kafka_idemp_set_fatal_error(RK,ERR,...) do {                 \
                 if (rd_kafka_is_transactional(RK))                      \
-                        rd_kafka_txn_set_abortable_error(RK, ERR,       \
-                                                         __VA_ARGS__);  \
+                        rd_kafka_txn_set_fatal_error(rk, RD_DO_LOCK, ERR, \
+                                                     __VA_ARGS__);      \
                 else                                                    \
                         rd_kafka_set_fatal_error(RK, ERR, __VA_ARGS__); \
         } while (0)

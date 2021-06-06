@@ -39,7 +39,8 @@
 
 
 void rd_kafka_error_destroy (rd_kafka_error_t *error) {
-        rd_free(error);
+        if (error)
+                rd_free(error);
 }
 
 
@@ -73,6 +74,31 @@ rd_kafka_error_t *rd_kafka_error_new_v (rd_kafka_resp_err_t code,
 
         return error;
 }
+
+rd_kafka_error_t *rd_kafka_error_copy (const rd_kafka_error_t *src) {
+        rd_kafka_error_t *error;
+        ssize_t strsz = 0;
+
+        if (src->errstr) {
+                strsz = strlen(src->errstr);
+        }
+
+        error = rd_malloc(sizeof(*error) + strsz);
+        error->code = src->code;
+        error->fatal = src->fatal;
+        error->retriable = src->retriable;
+        error->txn_requires_abort = src->txn_requires_abort;
+
+        if (strsz > 0) {
+                error->errstr = (char *)(error+1);
+                rd_strlcpy(error->errstr, src->errstr, strsz);
+        } else {
+                error->errstr = NULL;
+        }
+
+        return error;
+}
+
 
 rd_kafka_error_t *rd_kafka_error_new (rd_kafka_resp_err_t code,
                                       const char *fmt, ...) {
@@ -114,8 +140,8 @@ rd_kafka_error_t *rd_kafka_error_new_retriable (rd_kafka_resp_err_t code,
         return error;
 }
 
-rd_kafka_error_t *rd_kafka_error_new_txn_requires_abort (rd_kafka_resp_err_t code,
-                                                    const char *fmt, ...) {
+rd_kafka_error_t *rd_kafka_error_new_txn_requires_abort (
+        rd_kafka_resp_err_t code, const char *fmt, ...) {
         rd_kafka_error_t *error;
         va_list ap;
 
@@ -130,27 +156,29 @@ rd_kafka_error_t *rd_kafka_error_new_txn_requires_abort (rd_kafka_resp_err_t cod
 
 
 rd_kafka_resp_err_t rd_kafka_error_code (const rd_kafka_error_t *error) {
-        return error->code;
+        return error ? error->code : RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 const char *rd_kafka_error_name (const rd_kafka_error_t *error) {
-        return rd_kafka_err2name(error->code);
+        return error ? rd_kafka_err2name(error->code) : "";
 }
 
 const char *rd_kafka_error_string (const rd_kafka_error_t *error) {
+        if (!error)
+                return "";
         return error->errstr ? error->errstr : rd_kafka_err2str(error->code);
 }
 
 int rd_kafka_error_is_fatal (const rd_kafka_error_t *error) {
-        return error->fatal ? 1 : 0;
+        return error && error->fatal ? 1 : 0;
 }
 
 int rd_kafka_error_is_retriable (const rd_kafka_error_t *error) {
-        return error->retriable ? 1 : 0;
+        return error && error->retriable ? 1 : 0;
 }
 
 int rd_kafka_error_txn_requires_abort (const rd_kafka_error_t *error) {
-        return error->txn_requires_abort ? 1 : 0;
+        return error && error->txn_requires_abort ? 1 : 0;
 }
 
 

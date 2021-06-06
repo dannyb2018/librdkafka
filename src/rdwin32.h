@@ -32,14 +32,14 @@
 #ifndef _RDWIN32_H_
 #define _RDWIN32_H_
 
-
 #include <stdlib.h>
 #include <inttypes.h>
 #include <sys/types.h>
 #include <time.h>
 #include <assert.h>
+
 #define WIN32_MEAN_AND_LEAN
-#include <Winsock2.h>  /* for struct timeval */
+#include <winsock2.h>  /* for sockets + struct timeval */
 #include <io.h>
 #include <fcntl.h>
 
@@ -47,7 +47,10 @@
 /**
  * Types
  */
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
 typedef SSIZE_T ssize_t;
+#endif
 typedef int socklen_t;
 
 struct iovec {
@@ -76,7 +79,13 @@ struct msghdr {
 #define RD_WARN_UNUSED_RESULT
 #define RD_NORETURN __declspec(noreturn)
 #define RD_IS_CONSTANT(p)  (0)
+#ifdef _MSC_VER
 #define RD_TLS __declspec(thread)
+#elif defined(__MINGW32__)
+#define RD_TLS __thread
+#else
+#error Unknown Windows compiler, cannot set RD_TLS (thread-local-storage attribute)
+#endif
 
 
 /**
@@ -93,7 +102,9 @@ struct msghdr {
 #define PRIusz  "Iu"
 #define PRIdsz  "Id"
 
+#ifndef RD_FORMAT
 #define RD_FORMAT(...)
+#endif
 
 static RD_UNUSED RD_INLINE
 int rd_vsnprintf (char *str, size_t size, const char *format, va_list ap) {
@@ -122,6 +133,10 @@ int rd_snprintf (char *str, size_t size, const char *format, ...) {
 
 #define rd_strcasecmp(A,B) _stricmp(A,B)
 #define rd_strncasecmp(A,B,N) _strnicmp(A,B,N)
+/* There is a StrStrIA() but it requires extra linking, so use our own
+ * implementation instead. */
+#define rd_strcasestr(HAYSTACK,NEEDLE) _rd_strcasestr(HAYSTACK,NEEDLE)
+
 
 
 /**
@@ -253,7 +268,7 @@ typedef WSAPOLLFD rd_pollfd_t;
  * @returns 0 on success or -1 on failure (see rd_kafka_rd_socket_errno)
  */
 static RD_UNUSED int rd_fd_set_nonblocking (rd_socket_t fd) {
-        int on = 1;
+        u_long on = 1;
         if (ioctlsocket(fd, FIONBIO, &on) == SOCKET_ERROR)
                 return (int)WSAGetLastError();
         return 0;

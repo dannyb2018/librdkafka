@@ -30,6 +30,8 @@
 #ifndef _RDKAFKA_ERROR_H_
 #define _RDKAFKA_ERROR_H_
 
+#include <stdarg.h>
+
 /**
  * @name Public API complex error type implementation.
  *
@@ -50,17 +52,23 @@ struct rd_kafka_error_s {
 rd_kafka_error_t *rd_kafka_error_new_v (rd_kafka_resp_err_t code,
                                         const char *fmt, va_list ap);
 
+rd_kafka_error_t *rd_kafka_error_copy (const rd_kafka_error_t *src);
+
 void rd_kafka_error_set_fatal (rd_kafka_error_t *error);
 void rd_kafka_error_set_retriable (rd_kafka_error_t *error);
 void rd_kafka_error_set_txn_requires_abort (rd_kafka_error_t *error);
 
 
 rd_kafka_error_t *rd_kafka_error_new_fatal (rd_kafka_resp_err_t code,
-                                            const char *fmt, ...);
+                                            const char *fmt, ...)
+        RD_FORMAT(printf, 2, 3);
 rd_kafka_error_t *rd_kafka_error_new_retriable (rd_kafka_resp_err_t code,
-                                                const char *fmt, ...);
-rd_kafka_error_t *rd_kafka_error_new_txn_requires_abort (rd_kafka_resp_err_t code,
-                                                    const char *fmt, ...);
+                                                const char *fmt, ...)
+        RD_FORMAT(printf, 2, 3);
+rd_kafka_error_t *
+rd_kafka_error_new_txn_requires_abort (rd_kafka_resp_err_t code,
+                                       const char *fmt, ...)
+        RD_FORMAT(printf, 2, 3);
 
 
 rd_kafka_resp_err_t rd_kafka_error_to_legacy (rd_kafka_error_t *error,

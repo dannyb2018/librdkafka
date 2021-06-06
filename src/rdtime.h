@@ -79,12 +79,12 @@ BOOL rd_ut_QueryPerformanceCounter(_Out_ LARGE_INTEGER * lpPerformanceCount);
  */
 static RD_INLINE rd_ts_t rd_clock (void) RD_UNUSED;
 static RD_INLINE rd_ts_t rd_clock (void) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || (defined(__ANDROID__) && __ANDROID_API__ < 29)
 	/* No monotonic clock on Darwin */
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return ((rd_ts_t)tv.tv_sec * 1000000LLU) + (rd_ts_t)tv.tv_usec;
-#elif defined(_MSC_VER)
+#elif defined(_WIN32)
         LARGE_INTEGER now;
         static RD_TLS double freq = 0.0;
         if (!freq) {
@@ -124,7 +124,7 @@ static RD_INLINE const char *rd_ctime (const time_t *t) RD_UNUSED;
 static RD_INLINE const char *rd_ctime (const time_t *t) {
 	static RD_TLS char ret[27];
 
-#ifndef _MSC_VER
+#ifndef _WIN32
 	ctime_r(t, ret);
 #else
 	ctime_s(ret, sizeof(ret), t);
@@ -195,7 +195,7 @@ static RD_INLINE void rd_timeout_init_timespec_us (struct timespec *tspec,
                 tspec->tv_sec = timeout_us;
                 tspec->tv_nsec = 0;
         } else {
-#ifdef __APPLE__
+#if defined(__APPLE__) || (defined(__ANDROID__) && __ANDROID_API__ < 29)
                 struct timeval tv;
                 gettimeofday(&tv, NULL);
                 TIMEVAL_TO_TIMESPEC(&tv, tspec);
@@ -226,7 +226,7 @@ static RD_INLINE void rd_timeout_init_timespec (struct timespec *tspec,
                 tspec->tv_sec = timeout_ms;
                 tspec->tv_nsec = 0;
         } else {
-#ifdef __APPLE__
+#if defined(__APPLE__) || (defined(__ANDROID__) && __ANDROID_API__ < 29)
                 struct timeval tv;
                 gettimeofday(&tv, NULL);
                 TIMEVAL_TO_TIMESPEC(&tv, tspec);

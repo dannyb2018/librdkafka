@@ -34,8 +34,65 @@
 extern const char *rd_kafka_topic_state_names[];
 
 
-/* rd_kafka_topic_t: internal representation of a topic */
+/**
+ * @struct Light-weight topic object which only contains the topic name.
+ *
+ * For use in outgoing APIs (like rd_kafka_message_t) when there is
+ * no proper topic object available.
+ *
+ * @remark lrkt_magic[4] MUST be the first field and be set to "LRKT".
+ */
+struct rd_kafka_lwtopic_s {
+        char  lrkt_magic[4];     /**< "LRKT" */
+        rd_kafka_t *lrkt_rk;     /**< Pointer to the client instance. */
+        rd_refcnt_t lrkt_refcnt; /**< Refcount */
+        char *lrkt_topic;        /**< Points past this struct, allocated
+                                  *   along with the struct. */
+};
+
+/** Casts a topic_t to a light-weight lwtopic_t */
+#define rd_kafka_rkt_lw(rkt)                    \
+        ((rd_kafka_lwtopic_t *)rkt)
+
+#define rd_kafka_rkt_lw_const(rkt)              \
+        ((const rd_kafka_lwtopic_t *)rkt)
+
+/**
+ * @returns true if the topic object is a light-weight topic, else false.
+ */
+static RD_UNUSED RD_INLINE
+rd_bool_t rd_kafka_rkt_is_lw (const rd_kafka_topic_t *app_rkt) {
+        const rd_kafka_lwtopic_t *lrkt = rd_kafka_rkt_lw_const(app_rkt);
+        return !memcmp(lrkt->lrkt_magic, "LRKT", 4);
+}
+
+/** @returns the lwtopic_t if \p rkt is a light-weight topic, else NULL. */
+static RD_UNUSED RD_INLINE
+rd_kafka_lwtopic_t *rd_kafka_rkt_get_lw (rd_kafka_topic_t *rkt) {
+        if (rd_kafka_rkt_is_lw(rkt))
+                return rd_kafka_rkt_lw(rkt);
+        return NULL;
+}
+
+void rd_kafka_lwtopic_destroy (rd_kafka_lwtopic_t *lrkt);
+rd_kafka_lwtopic_t *rd_kafka_lwtopic_new (rd_kafka_t *rk, const char *topic);
+
+static RD_UNUSED RD_INLINE
+void rd_kafka_lwtopic_keep (rd_kafka_lwtopic_t *lrkt) {
+        rd_refcnt_add(&lrkt->lrkt_refcnt);
+}
+
+
+
+
+/*
+ * @struct Internal representation of a topic.
+ *
+ * @remark rkt_magic[4] MUST be the first field and be set to "IRKT".
+ */
 struct rd_kafka_topic_s {
+        char  rkt_magic[4];  /**< "IRKT" */
+
 	TAILQ_ENTRY(rd_kafka_topic_s) rkt_link;
 
 	rd_refcnt_t        rkt_refcnt;
@@ -47,10 +104,19 @@ struct rd_kafka_topic_s {
 	rd_kafka_toppar_t **rkt_p;          /**< Partition array */
 	int32_t            rkt_partition_cnt;
 
+        int32_t            rkt_sticky_partition;    /**< Current sticky partition.
+                                                     *     @locks rkt_lock */
+        rd_interval_t      rkt_sticky_intvl;        /**< Interval to assign new 
+                                                     *   sticky partition. */
+
         rd_list_t          rkt_desp;              /* Desired partitions
                                                    * that are not yet seen
                                                    * in the cluster. */
+        rd_interval_t      rkt_desp_refresh_intvl; /**< Rate-limiter for
+                                                    *   desired partition
+                                                    *   metadata refresh. */
 
+        rd_ts_t            rkt_ts_create;   /**< Topic object creation time. */
 	rd_ts_t            rkt_ts_metadata; /* Timestamp of last metadata
 					     * update for this topic. */
 
@@ -61,11 +127,15 @@ struct rd_kafka_topic_s {
 		RD_KAFKA_TOPIC_S_UNKNOWN,   /* No cluster information yet */
 		RD_KAFKA_TOPIC_S_EXISTS,    /* Topic exists in cluster */
 		RD_KAFKA_TOPIC_S_NOTEXISTS, /* Topic is not known in cluster */
+                RD_KAFKA_TOPIC_S_ERROR,     /* Topic exists but is in an errored
+                                             * state, such as auth failure. */
 	} rkt_state;
 
         int               rkt_flags;
 #define RD_KAFKA_TOPIC_F_LEADER_UNAVAIL   0x1 /* Leader lost/unavailable
                                                * for at least one partition. */
+
+        rd_kafka_resp_err_t rkt_err;        /**< Permanent error. */
 
 	rd_kafka_t       *rkt_rk;
 
@@ -85,13 +155,20 @@ struct rd_kafka_topic_s {
 /**
  * @brief Increase refcount and return topic object.
  */
-static RD_UNUSED RD_INLINE
+static RD_INLINE RD_UNUSED
 rd_kafka_topic_t *rd_kafka_topic_keep (rd_kafka_topic_t *rkt) {
-        rd_refcnt_add(&rkt->rkt_refcnt);
+        rd_kafka_lwtopic_t *lrkt;
+        if (unlikely((lrkt = rd_kafka_rkt_get_lw(rkt)) != NULL))
+                rd_kafka_lwtopic_keep(lrkt);
+        else
+                rd_refcnt_add(&rkt->rkt_refcnt);
         return rkt;
 }
 
 void rd_kafka_topic_destroy_final (rd_kafka_topic_t *rkt);
+
+rd_kafka_topic_t *rd_kafka_topic_proper (rd_kafka_topic_t *app_rkt);
+
 
 
 /**
@@ -99,7 +176,10 @@ void rd_kafka_topic_destroy_final (rd_kafka_topic_t *rkt);
  */
 static RD_INLINE RD_UNUSED void
 rd_kafka_topic_destroy0 (rd_kafka_topic_t *rkt) {
-        if (unlikely(rd_refcnt_sub(&rkt->rkt_refcnt) == 0))
+        rd_kafka_lwtopic_t *lrkt;
+        if (unlikely((lrkt = rd_kafka_rkt_get_lw(rkt)) != NULL))
+                rd_kafka_lwtopic_destroy(lrkt);
+        else if (unlikely(rd_refcnt_sub(&rkt->rkt_refcnt) == 0))
                 rd_kafka_topic_destroy_final(rkt);
 }
 
@@ -123,7 +203,26 @@ int rd_kafka_topic_cmp_rkt (const void *_a, const void *_b);
 
 void rd_kafka_topic_partitions_remove (rd_kafka_topic_t *rkt);
 
-void rd_kafka_topic_metadata_none (rd_kafka_topic_t *rkt);
+rd_bool_t rd_kafka_topic_set_notexists (rd_kafka_topic_t *rkt,
+                                        rd_kafka_resp_err_t err);
+rd_bool_t rd_kafka_topic_set_error (rd_kafka_topic_t *rkt,
+                                    rd_kafka_resp_err_t err);
+
+/**
+ * @returns the topic's permanent error, if any.
+ *
+ * @locality any
+ * @locks_acquired rd_kafka_topic_rdlock(rkt)
+ */
+static RD_INLINE RD_UNUSED rd_kafka_resp_err_t
+rd_kafka_topic_get_error (rd_kafka_topic_t *rkt) {
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
+        rd_kafka_topic_rdlock(rkt);
+        if (rkt->rkt_state == RD_KAFKA_TOPIC_S_ERROR)
+                err = rkt->rkt_err;
+        rd_kafka_topic_rdunlock(rkt);
+        return err;
+}
 
 int rd_kafka_topic_metadata_update2 (rd_kafka_broker_t *rkb,
                                      const struct rd_kafka_metadata_topic *mdt);
@@ -136,7 +235,7 @@ typedef struct rd_kafka_topic_info_s {
 	int   partition_cnt;
 } rd_kafka_topic_info_t;
 
-
+int rd_kafka_topic_info_topic_cmp (const void *_a, const void *_b);
 int rd_kafka_topic_info_cmp (const void *_a, const void *_b);
 rd_kafka_topic_info_t *rd_kafka_topic_info_new (const char *topic,
 						int partition_cnt);
@@ -162,7 +261,8 @@ void rd_kafka_topic_leader_query0 (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 #define rd_kafka_topic_fast_leader_query(rk) \
         rd_kafka_metadata_fast_leader_query(rk)
 
-void rd_kafka_local_topics_to_list (rd_kafka_t *rk, rd_list_t *topics);
+void rd_kafka_local_topics_to_list (rd_kafka_t *rk, rd_list_t *topics,
+                                    int *cache_cntp);
 
 void rd_ut_kafka_topic_set_topic_exists (rd_kafka_topic_t *rkt,
                                          int partition_cnt,

@@ -3,24 +3,24 @@
  *
  * Copyright (c) 2012-2013, Magnus Edenhill
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met: 
- * 
+ * modification, are permitted provided that the following conditions are met:
+ *
  * 1. Redistributions of source code must retain the above copyright notice,
- *    this list of conditions and the following disclaimer. 
+ *    this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution. 
- * 
+ *    and/or other materials provided with the distribution.
+ *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE 
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE 
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
@@ -34,6 +34,10 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#if !_WIN32
+#include <sys/types.h>
+#include <dirent.h>
+#endif
 
 #include "rdkafka_int.h"
 #include "rdkafka_msg.h"
@@ -58,7 +62,7 @@
 #include "crc32c.h"
 #include "rdunittest.h"
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 #include <sys/types.h>
 #include <sys/timeb.h>
 #endif
@@ -227,8 +231,8 @@ int rd_kafka_wait_destroyed (int timeout_ms) {
 }
 
 static void rd_kafka_log_buf (const rd_kafka_conf_t *conf,
-                              const rd_kafka_t *rk, int level, const char *fac,
-                              const char *buf) {
+                              const rd_kafka_t *rk, int level, int ctx,
+                              const char *fac, const char *buf) {
         if (level > conf->log_level)
                 return;
         else if (rk && conf->log_queue) {
@@ -242,6 +246,7 @@ static void rd_kafka_log_buf (const rd_kafka_conf_t *conf,
                 rko->rko_u.log.level = level;
                 rd_strlcpy(rko->rko_u.log.fac, fac, sizeof(rko->rko_u.log.fac));
                 rko->rko_u.log.str = rd_strdup(buf);
+                rko->rko_u.log.ctx = ctx;
                 rd_kafka_q_enq(rk->rk_logq, rko);
 
         } else if (conf->log_cb) {
@@ -256,7 +261,7 @@ static void rd_kafka_log_buf (const rd_kafka_conf_t *conf,
  */
 void rd_kafka_log0 (const rd_kafka_conf_t *conf,
                     const rd_kafka_t *rk,
-                    const char *extra, int level,
+                    const char *extra, int level, int ctx,
                     const char *fac, const char *fmt, ...) {
 	char buf[2048];
 	va_list ap;
@@ -285,7 +290,7 @@ void rd_kafka_log0 (const rd_kafka_conf_t *conf,
 	rd_vsnprintf(buf+of, sizeof(buf)-of, fmt, ap);
 	va_end(ap);
 
-        rd_kafka_log_buf(conf, rk, level, fac, buf);
+        rd_kafka_log_buf(conf, rk, level, ctx, fac, buf);
 }
 
 rd_kafka_resp_err_t
@@ -490,6 +495,12 @@ static const struct rd_kafka_err_desc rd_kafka_err_descs[] = {
                   "Local: This instance has been fenced by a newer instance"),
         _ERR_DESC(RD_KAFKA_RESP_ERR__APPLICATION,
                   "Local: Application generated error"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR__ASSIGNMENT_LOST,
+                  "Local: Group partition assignment lost"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR__NOOP,
+                  "Local: No operation performed"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR__AUTO_OFFSET_RESET,
+                  "Local: No offset to automatically reset to"),
 
 	_ERR_DESC(RD_KAFKA_RESP_ERR_UNKNOWN,
 		  "Unknown broker error"),
@@ -671,6 +682,44 @@ static const struct rd_kafka_err_desc rd_kafka_err_descs[] = {
         _ERR_DESC(RD_KAFKA_RESP_ERR_FENCED_INSTANCE_ID,
                   "Broker: Static consumer fenced by other consumer with same "
                   "group.instance.id"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_ELIGIBLE_LEADERS_NOT_AVAILABLE,
+                  "Broker: Eligible partition leaders are not available"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_ELECTION_NOT_NEEDED,
+                  "Broker: Leader election not needed for topic partition"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_NO_REASSIGNMENT_IN_PROGRESS,
+                  "Broker: No partition reassignment is in progress"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_GROUP_SUBSCRIBED_TO_TOPIC,
+                  "Broker: Deleting offsets of a topic while the consumer "
+                  "group is subscribed to it"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_INVALID_RECORD,
+                  "Broker: Broker failed to validate record"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_UNSTABLE_OFFSET_COMMIT,
+                  "Broker: There are unstable offsets that need to be cleared"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_THROTTLING_QUOTA_EXCEEDED,
+                  "Broker: Throttling quota has been exceeded"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_PRODUCER_FENCED,
+                  "Broker: There is a newer producer with the same "
+                  "transactionalId which fences the current one"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_RESOURCE_NOT_FOUND,
+                  "Broker: Request illegally referred to resource that "
+                  "does not exist"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_DUPLICATE_RESOURCE,
+                  "Broker: Request illegally referred to the same resource "
+                  "twice"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_UNACCEPTABLE_CREDENTIAL,
+                  "Broker: Requested credential would not meet criteria for "
+                  "acceptability"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_INCONSISTENT_VOTER_SET,
+                  "Broker: Indicates that the either the sender or recipient "
+                  "of a voter-only request is not one of the expected voters"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_INVALID_UPDATE_VERSION,
+                  "Broker: Invalid update version"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_FEATURE_UPDATE_FAILED,
+                  "Broker: Unable to update finalized features due to "
+                  "server error"),
+        _ERR_DESC(RD_KAFKA_RESP_ERR_PRINCIPAL_DESERIALIZATION_FAILURE,
+                  "Broker: Request principal deserialization failed during "
+                  "forwarding"),
 
 	_ERR_DESC(RD_KAFKA_RESP_ERR__END, NULL)
 };
@@ -827,11 +876,12 @@ int rd_kafka_set_fatal_error0 (rd_kafka_t *rk, rd_dolock_t do_lock,
          * while for all other client types (the producer) we propagate to
          * the standard error handler (typically error_cb). */
         if (rk->rk_type == RD_KAFKA_CONSUMER && rk->rk_cgrp)
-                rd_kafka_q_op_err(rk->rk_cgrp->rkcg_q,
-                                  RD_KAFKA_OP_CONSUMER_ERR,
-                                  RD_KAFKA_RESP_ERR__FATAL, 0, NULL, 0,
-                                  "Fatal error: %s: %s",
-                                  rd_kafka_err2str(err), rk->rk_fatal.errstr);
+                rd_kafka_consumer_err(rk->rk_cgrp->rkcg_q, RD_KAFKA_NODEID_UA,
+                                      RD_KAFKA_RESP_ERR__FATAL, 0, NULL, NULL,
+                                      RD_KAFKA_OFFSET_INVALID,
+                                      "Fatal error: %s: %s",
+                                      rd_kafka_err2str(err),
+                                      rk->rk_fatal.errstr);
         else
                 rd_kafka_op_err(rk, RD_KAFKA_RESP_ERR__FATAL,
                                 "Fatal error: %s: %s",
@@ -880,10 +930,6 @@ void rd_kafka_destroy_final (rd_kafka_t *rk) {
         rd_kafka_wrlock(rk);
         rd_kafka_wrunlock(rk);
 
-        rd_kafka_assignors_term(rk);
-
-        rd_kafka_metadata_cache_destroy(rk);
-
         /* Terminate SASL provider */
         if (rk->rk_conf.sasl.provider)
                 rd_kafka_sasl_term(rk);
@@ -899,6 +945,14 @@ void rd_kafka_destroy_final (rd_kafka_t *rk) {
                 /* Reset queue forwarding (rep -> cgrp) */
                 rd_kafka_q_fwd_set(rk->rk_rep, NULL);
                 rd_kafka_cgrp_destroy_final(rk->rk_cgrp);
+        }
+
+        rd_kafka_assignors_term(rk);
+
+        if (rk->rk_type == RD_KAFKA_CONSUMER) {
+                rd_kafka_assignment_destroy(rk);
+                if (rk->rk_consumer.q)
+                        rd_kafka_q_destroy(rk->rk_consumer.q);
         }
 
 	/* Purge op-queues */
@@ -947,7 +1001,6 @@ void rd_kafka_destroy_final (rd_kafka_t *rk) {
 	rd_kafka_anyconf_destroy(_RK_GLOBAL, &rk->rk_conf);
         rd_list_destroy(&rk->rk_broker_by_id);
 
-	rd_kafkap_bytes_destroy((rd_kafkap_bytes_t *)rk->rk_null_bytes);
 	rwlock_destroy(&rk->rk_lock);
 
 	rd_free(rk);
@@ -957,7 +1010,7 @@ void rd_kafka_destroy_final (rd_kafka_t *rk) {
 
 static void rd_kafka_destroy_app (rd_kafka_t *rk, int flags) {
         thrd_t thrd;
-#ifndef _MSC_VER
+#ifndef _WIN32
 	int term_sig = rk->rk_conf.term_sig;
 #endif
         int res;
@@ -980,6 +1033,27 @@ static void rd_kafka_destroy_app (rd_kafka_t *rk, int flags) {
         rd_kafka_dbg(rk, ALL, "DESTROY", "Terminating instance "
                      "(destroy flags %s (0x%x))",
                      flags ? flags_str : "none", flags);
+
+        /* If producer still has messages in queue the application
+         * is terminating the producer without first calling flush() or purge()
+         * which is a common new user mistake, so hint the user of proper
+         * shutdown semantics. */
+        if (rk->rk_type == RD_KAFKA_PRODUCER) {
+                unsigned int tot_cnt;
+                size_t tot_size;
+
+                rd_kafka_curr_msgs_get(rk, &tot_cnt, &tot_size);
+
+                if (tot_cnt > 0)
+                        rd_kafka_log(rk, LOG_WARNING, "TERMINATE",
+                                     "Producer terminating with %u message%s "
+                                     "(%"PRIusz" byte%s) still in "
+                                     "queue or transit: "
+                                     "use flush() to wait for "
+                                     "outstanding message delivery",
+                                     tot_cnt, tot_cnt > 1 ? "s" : "",
+                                     tot_size, tot_size > 1 ? "s" : "");
+        }
 
         /* Make sure destroy is not called from a librdkafka thread
          * since this will most likely cause a deadlock.
@@ -1023,7 +1097,7 @@ static void rd_kafka_destroy_app (rd_kafka_t *rk, int flags) {
          * The op itself is (likely) ignored by the receiver. */
         rd_kafka_q_enq(rk->rk_ops, rd_kafka_op_new(RD_KAFKA_OP_TERMINATE));
 
-#ifndef _MSC_VER
+#ifndef _WIN32
         /* Interrupt main kafka thread to speed up termination. */
 	if (term_sig) {
                 rd_kafka_dbg(rk, GENERIC, "TERMINATE",
@@ -1073,9 +1147,6 @@ static void rd_kafka_destroy_internal (rd_kafka_t *rk) {
 
         rd_kafka_dbg(rk, ALL, "DESTROY", "Destroy internal");
 
-        /* Destroy the coordinator cache */
-        rd_kafka_coord_cache_destroy(&rk->rk_coord_cache);
-
         /* Trigger any state-change waiters (which should check the
          * terminate flag whenever they wake up). */
         rd_kafka_brokers_broadcast_state_change(rk);
@@ -1117,7 +1188,7 @@ static void rd_kafka_destroy_internal (rd_kafka_t *rk) {
          * reaches 1 and then decommissions itself. */
         TAILQ_FOREACH_SAFE(rkb, &rk->rk_brokers, rkb_link, rkb_tmp) {
                 /* Add broker's thread to wait_thrds list for later joining */
-                thrd = malloc(sizeof(*thrd));
+                thrd = rd_malloc(sizeof(*thrd));
                 *thrd = rkb->rkb_thread;
                 rd_list_add(&wait_thrds, thrd);
                 rd_kafka_wrunlock(rk);
@@ -1130,7 +1201,7 @@ static void rd_kafka_destroy_internal (rd_kafka_t *rk) {
                 rd_kafka_q_enq(rkb->rkb_ops,
                                rd_kafka_op_new(RD_KAFKA_OP_TERMINATE));
 
-#ifndef _MSC_VER
+#ifndef _WIN32
                 /* Interrupt IO threads to speed up termination. */
                 if (rk->rk_conf.term_sig)
 			pthread_kill(rkb->rkb_thread, rk->rk_conf.term_sig);
@@ -1146,12 +1217,32 @@ static void rd_kafka_destroy_internal (rd_kafka_t *rk) {
                 rk->rk_clusterid = NULL;
         }
 
+        /* Destroy coord requests */
+        rd_kafka_coord_reqs_term(rk);
+
+        /* Destroy the coordinator cache */
+        rd_kafka_coord_cache_destroy(&rk->rk_coord_cache);
+
+        /* Purge metadata cache.
+         * #3279:
+         * We mustn't call cache_destroy() here since there might be outstanding
+         * broker rkos that hold references to the metadata cache lock,
+         * and these brokers are destroyed below. So to avoid a circular
+         * dependency refcnt deadlock we first purge the cache here
+         * and destroy it after the brokers are destroyed. */
+        rd_kafka_metadata_cache_purge(rk, rd_true/*observers too*/);
+
         rd_kafka_wrunlock(rk);
 
         mtx_lock(&rk->rk_broker_state_change_lock);
         /* Purge broker state change waiters */
         rd_list_destroy(&rk->rk_broker_state_change_waiters);
         mtx_unlock(&rk->rk_broker_state_change_lock);
+
+        if (rk->rk_type == RD_KAFKA_CONSUMER) {
+                if (rk->rk_consumer.q)
+                        rd_kafka_q_disable(rk->rk_consumer.q);
+        }
 
         rd_kafka_dbg(rk, GENERIC, "TERMINATE",
                      "Purging reply queue");
@@ -1171,7 +1262,7 @@ static void rd_kafka_destroy_internal (rd_kafka_t *rk) {
                                rd_kafka_op_new(RD_KAFKA_OP_TERMINATE));
 
                 rk->rk_internal_rkb = NULL;
-                thrd = malloc(sizeof(*thrd));
+                thrd = rd_malloc(sizeof(*thrd));
                 *thrd = rkb->rkb_thread;
                 rd_list_add(&wait_thrds, thrd);
         }
@@ -1188,7 +1279,7 @@ static void rd_kafka_destroy_internal (rd_kafka_t *rk) {
                 int res;
                 if (thrd_join(*thrd, &res) != thrd_success)
                         ;
-                free(thrd);
+                rd_free(thrd);
         }
 
         rd_list_destroy(&wait_thrds);
@@ -1207,6 +1298,11 @@ static void rd_kafka_destroy_internal (rd_kafka_t *rk) {
                 rd_assert(!*"All mock clusters must be destroyed prior to "
                           "rd_kafka_t destroy");
         }
+
+        /* Destroy metadata cache */
+        rd_kafka_wrlock(rk);
+        rd_kafka_metadata_cache_destroy(rk);
+        rd_kafka_wrunlock(rk);
 }
 
 /**
@@ -1301,6 +1397,7 @@ static RD_INLINE void rd_kafka_stats_emit_toppar (struct _stats_emit *st,
         rd_kafka_t *rk = rktp->rktp_rkt->rkt_rk;
         int64_t end_offset;
         int64_t consumer_lag = -1;
+        int64_t consumer_lag_stored = -1;
         struct offset_stats offs;
         int32_t broker_id = -1;
 
@@ -1320,19 +1417,21 @@ static RD_INLINE void rd_kafka_stats_emit_toppar (struct _stats_emit *st,
                 : rktp->rktp_hi_offset;
 
         /* Calculate consumer_lag by using the highest offset
-         * of app_offset (the last message passed to application + 1)
+         * of stored_offset (the last message passed to application + 1, or
+         * if enable.auto.offset.store=false the last message manually stored),
          * or the committed_offset (the last message committed by this or
          * another consumer).
-         * Using app_offset allows consumer_lag to be up to date even if
+         * Using stored_offset allows consumer_lag to be up to date even if
          * offsets are not (yet) committed.
          */
-        if (end_offset != RD_KAFKA_OFFSET_INVALID &&
-            (rktp->rktp_app_offset >= 0 || rktp->rktp_committed_offset >= 0)) {
-                consumer_lag = end_offset -
-                        RD_MAX(rktp->rktp_app_offset,
-                               rktp->rktp_committed_offset);
-                if (unlikely(consumer_lag) < 0)
-                        consumer_lag = 0;
+        if (end_offset != RD_KAFKA_OFFSET_INVALID) {
+                if (rktp->rktp_stored_offset >= 0 &&
+                    rktp->rktp_stored_offset <= end_offset)
+                        consumer_lag_stored =
+                                end_offset - rktp->rktp_stored_offset;
+                if (rktp->rktp_committed_offset >= 0 &&
+                    rktp->rktp_committed_offset <= end_offset)
+                        consumer_lag = end_offset - rktp->rktp_committed_offset;
         }
 
 	_st_printf("%s\"%"PRId32"\": { "
@@ -1359,6 +1458,7 @@ static RD_INLINE void rd_kafka_stats_emit_toppar (struct _stats_emit *st,
 		   "\"hi_offset\":%"PRId64", "
                    "\"ls_offset\":%"PRId64", "
                    "\"consumer_lag\":%"PRId64", "
+                   "\"consumer_lag_stored\":%"PRId64", "
 		   "\"txmsgs\":%"PRIu64", "
 		   "\"txbytes\":%"PRIu64", "
                    "\"rxmsgs\":%"PRIu64", "
@@ -1396,6 +1496,7 @@ static RD_INLINE void rd_kafka_stats_emit_toppar (struct _stats_emit *st,
 		   rktp->rktp_hi_offset,
                    rktp->rktp_ls_offset,
                    consumer_lag,
+                   consumer_lag_stored,
                    rd_atomic64_get(&rktp->rktp_c.tx_msgs),
                    rd_atomic64_get(&rktp->rktp_c.tx_msg_bytes),
                    rd_atomic64_get(&rktp->rktp_c.rx_msgs),
@@ -1461,7 +1562,19 @@ static void rd_kafka_stats_emit_broker_reqs (struct _stats_emit *st,
                         [RD_KAFKAP_CreateDelegationToken] = rd_true,
                         [RD_KAFKAP_RenewDelegationToken] = rd_true,
                         [RD_KAFKAP_ExpireDelegationToken] = rd_true,
-                        [RD_KAFKAP_DescribeDelegationToken] = rd_true
+                        [RD_KAFKAP_DescribeDelegationToken] = rd_true,
+                        [RD_KAFKAP_IncrementalAlterConfigs] = rd_true,
+                        [RD_KAFKAP_ElectLeaders] = rd_true,
+                        [RD_KAFKAP_AlterPartitionReassignments] = rd_true,
+                        [RD_KAFKAP_ListPartitionReassignments] = rd_true,
+                        [RD_KAFKAP_AlterUserScramCredentials] = rd_true,
+                        [RD_KAFKAP_Vote] = rd_true,
+                        [RD_KAFKAP_BeginQuorumEpoch] = rd_true,
+                        [RD_KAFKAP_EndQuorumEpoch] = rd_true,
+                        [RD_KAFKAP_DescribeQuorum] = rd_true,
+                        [RD_KAFKAP_AlterIsr] = rd_true,
+                        [RD_KAFKAP_UpdateFeatures] = rd_true,
+                        [RD_KAFKAP_Envelope] = rd_true,
                 },
                 [3/*hide-unless-non-zero*/] = {
                         /* Hide Admin requests unless they've been used */
@@ -1531,6 +1644,7 @@ static void rd_kafka_stats_emit_all (rd_kafka_t *rk) {
                    "\"type\": \"%s\", "
 		   "\"ts\":%"PRId64", "
 		   "\"time\":%lli, "
+                   "\"age\":%"PRId64", "
 		   "\"replyq\":%i, "
                    "\"msg_cnt\":%u, "
 		   "\"msg_size\":%"PRIusz", "
@@ -1544,6 +1658,7 @@ static void rd_kafka_stats_emit_all (rd_kafka_t *rk) {
                    rd_kafka_type2str(rk->rk_type),
 		   now,
 		   (signed long long)time(NULL),
+                   now - rk->rk_ts_created,
 		   rd_kafka_q_len(rk->rk_rep),
 		   tot_cnt, tot_size,
 		   rk->rk_curr_msgs.max_cnt, rk->rk_curr_msgs.max_size,
@@ -1553,8 +1668,26 @@ static void rd_kafka_stats_emit_all (rd_kafka_t *rk) {
 
 	TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
 		rd_kafka_toppar_t *rktp;
+                rd_ts_t txidle = -1, rxidle = -1;
 
 		rd_kafka_broker_lock(rkb);
+
+                if (rkb->rkb_state >= RD_KAFKA_BROKER_STATE_UP) {
+                        /* Calculate tx and rx idle time in usecs */
+                        txidle = rd_atomic64_get(&rkb->rkb_c.ts_send);
+                        rxidle = rd_atomic64_get(&rkb->rkb_c.ts_recv);
+
+                        if (txidle)
+                                txidle = RD_MAX(now - txidle, 0);
+                        else
+                                txidle = -1;
+
+                        if (rxidle)
+                                rxidle = RD_MAX(now - rxidle, 0);
+                        else
+                                rxidle = -1;
+                }
+
 		_st_printf("%s\"%s\": { "/*open broker*/
 			   "\"name\":\"%s\", "
 			   "\"nodeid\":%"PRId32", "
@@ -1570,12 +1703,14 @@ static void rd_kafka_stats_emit_all (rd_kafka_t *rk) {
 			   "\"txbytes\":%"PRIu64", "
 			   "\"txerrs\":%"PRIu64", "
 			   "\"txretries\":%"PRIu64", "
+                           "\"txidle\":%"PRIu64", "
 			   "\"req_timeouts\":%"PRIu64", "
 			   "\"rx\":%"PRIu64", "
 			   "\"rxbytes\":%"PRIu64", "
 			   "\"rxerrs\":%"PRIu64", "
                            "\"rxcorriderrs\":%"PRIu64", "
                            "\"rxpartial\":%"PRIu64", "
+                           "\"rxidle\":%"PRIu64", "
                            "\"zbuf_grow\":%"PRIu64", "
                            "\"buf_grow\":%"PRIu64", "
                            "\"wakeups\":%"PRIu64", "
@@ -1597,12 +1732,14 @@ static void rd_kafka_stats_emit_all (rd_kafka_t *rk) {
 			   rd_atomic64_get(&rkb->rkb_c.tx_bytes),
 			   rd_atomic64_get(&rkb->rkb_c.tx_err),
 			   rd_atomic64_get(&rkb->rkb_c.tx_retries),
+                           txidle,
 			   rd_atomic64_get(&rkb->rkb_c.req_timeouts),
 			   rd_atomic64_get(&rkb->rkb_c.rx),
 			   rd_atomic64_get(&rkb->rkb_c.rx_bytes),
 			   rd_atomic64_get(&rkb->rkb_c.rx_err),
 			   rd_atomic64_get(&rkb->rkb_c.rx_corrid_err),
 			   rd_atomic64_get(&rkb->rkb_c.rx_partial),
+                           rxidle,
                            rd_atomic64_get(&rkb->rkb_c.zbuf_grow),
                            rd_atomic64_get(&rkb->rkb_c.buf_grow),
                            rd_atomic64_get(&rkb->rkb_c.wakeups),
@@ -1653,10 +1790,12 @@ static void rd_kafka_stats_emit_all (rd_kafka_t *rk) {
 		rd_kafka_topic_rdlock(rkt);
 		_st_printf("%s\"%.*s\": { "
 			   "\"topic\":\"%.*s\", "
+                           "\"age\":%"PRId64", "
 			   "\"metadata_age\":%"PRId64", ",
 			   rkt==TAILQ_FIRST(&rk->rk_topics)?"":", ",
 			   RD_KAFKAP_STR_PR(rkt->rkt_topic),
 			   RD_KAFKAP_STR_PR(rkt->rkt_topic),
+                           (now - rkt->rkt_ts_create)/1000,
 			   rkt->rkt_ts_metadata ?
 			   (now - rkt->rkt_ts_metadata)/1000 : 0);
 
@@ -1808,33 +1947,34 @@ static void rd_kafka_stats_emit_tmr_cb (rd_kafka_timers_t *rkts, void *arg) {
  */
 static void rd_kafka_metadata_refresh_cb (rd_kafka_timers_t *rkts, void *arg) {
         rd_kafka_t *rk = rkts->rkts_rk;
-        int sparse = 1;
+        rd_kafka_resp_err_t err;
 
-        /* Dont do sparse requests if there is a consumer group with an
-         * active subscription since subscriptions need to be able to match
-         * on all topics. */
-        if (rk->rk_type == RD_KAFKA_CONSUMER && rk->rk_cgrp &&
-            rk->rk_cgrp->rkcg_flags & RD_KAFKA_CGRP_F_WILDCARD_SUBSCRIPTION)
-                sparse = 0;
+        /* High-level consumer:
+         * We need to query both locally known topics and subscribed topics
+         * so that we can detect locally known topics changing partition
+         * count or disappearing, as well as detect previously non-existent
+         * subscribed topics now being available in the cluster. */
+        if (rk->rk_type == RD_KAFKA_CONSUMER && rk->rk_cgrp)
+                err = rd_kafka_metadata_refresh_consumer_topics(
+                        rk, NULL,
+                        "periodic topic and broker list refresh");
+        else
+                err = rd_kafka_metadata_refresh_known_topics(
+                        rk, NULL, rd_true/*force*/,
+                        "periodic topic and broker list refresh");
 
-        if (sparse) {
-                if (rd_kafka_metadata_refresh_known_topics(
-                            rk, NULL, 1/*force*/,
-                            "periodic topic and broker list refresh") ==
-                    RD_KAFKA_RESP_ERR__UNKNOWN_TOPIC &&
-                    rd_interval(&rk->rk_suppress.broker_metadata_refresh,
-                                10*1000*1000 /*10s*/, 0) > 0) {
-                        /* If there are no (locally referenced) topics
-                         * to query, refresh the broker list.
-                         * This avoids getting idle-disconnected for clients
-                         * that have not yet referenced a topic and makes
-                         * sure such a client has an up to date broker list. */
-                        rd_kafka_metadata_refresh_brokers(
-                                rk, NULL,
-                                "periodic broker list refresh");
-                }
-        } else
-                rd_kafka_metadata_refresh_all(rk, NULL, "periodic refresh");
+
+        if (err == RD_KAFKA_RESP_ERR__UNKNOWN_TOPIC &&
+            rd_interval(&rk->rk_suppress.broker_metadata_refresh,
+                        10*1000*1000 /*10s*/, 0) > 0) {
+                /* If there are no (locally referenced) topics
+                 * to query, refresh the broker list.
+                 * This avoids getting idle-disconnected for clients
+                 * that have not yet referenced a topic and makes
+                 * sure such a client has an up to date broker list. */
+                rd_kafka_metadata_refresh_brokers(
+                        rk, NULL, "periodic broker list refresh");
+        }
 }
 
 
@@ -1911,7 +2051,8 @@ static int rd_kafka_thread_main (void *arg) {
         mtx_unlock(&rk->rk_init_lock);
 
 	while (likely(!rd_kafka_terminating(rk) ||
-		      rd_kafka_q_len(rk->rk_ops))) {
+		      rd_kafka_q_len(rk->rk_ops) ||
+                      (rk->rk_cgrp && (rk->rk_cgrp->rkcg_state != RD_KAFKA_CGRP_STATE_TERM)))) {
                 rd_ts_t sleeptime = rd_kafka_timers_next(
                         &rk->rk_timers, 1000*1000/*1s*/, 1/*lock*/);
                 rd_kafka_q_serve(rk->rk_ops, (int)(sleeptime / 1000), 0,
@@ -1965,7 +2106,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
         rd_kafka_resp_err_t ret_err = RD_KAFKA_RESP_ERR_NO_ERROR;
         int ret_errno = 0;
         const char *conf_err;
-#ifndef _MSC_VER
+#ifndef _WIN32
         sigset_t newset, oldset;
 #endif
         char builtin_features[128];
@@ -2008,6 +2149,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
 	rk = rd_calloc(1, sizeof(*rk));
 
 	rk->rk_type = type;
+        rk->rk_ts_created = rd_clock();
 
         /* Struct-copy the config object. */
 	rk->rk_conf = *conf;
@@ -2018,7 +2160,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
                                 * freed from rd_kafka_destroy_internal()
                                 * as the rk itself is destroyed. */
 
-        /* Seed PRNG */
+        /* Seed PRNG, don't bother about HAVE_RAND_R, since it is pretty cheap. */
         if (rk->rk_conf.enable_random_seed)
                 call_once(&rd_kafka_global_srand_once, rd_kafka_global_srand);
 
@@ -2041,7 +2183,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
         rd_interval_init(&rk->rk_suppress.sparse_connect_random);
         mtx_init(&rk->rk_suppress.sparse_connect_lock, mtx_plain);
 
-        rd_atomic64_init(&rk->rk_ts_last_poll, rd_clock());
+        rd_atomic64_init(&rk->rk_ts_last_poll, rk->rk_ts_created);
 
 	rk->rk_rep = rd_kafka_q_new(rk);
 	rk->rk_ops = rd_kafka_q_new(rk);
@@ -2056,12 +2198,10 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
 
 	TAILQ_INIT(&rk->rk_brokers);
 	TAILQ_INIT(&rk->rk_topics);
-        rd_kafka_timers_init(&rk->rk_timers, rk);
+        rd_kafka_timers_init(&rk->rk_timers, rk, rk->rk_ops);
         rd_kafka_metadata_cache_init(rk);
         rd_kafka_coord_cache_init(&rk->rk_coord_cache,
-                                  rk->rk_conf.metadata_refresh_interval_ms ?
-                                  rk->rk_conf.metadata_refresh_interval_ms :
-                                  (5 * 60 * 1000) /* 5min */);
+                                  rk->rk_conf.metadata_max_age_ms);
         rd_kafka_coord_reqs_init(rk);
 
 	if (rk->rk_conf.dr_cb || rk->rk_conf.dr_msg_cb)
@@ -2095,9 +2235,6 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
 
         /* Admin client defaults */
         rk->rk_conf.admin.request_timeout_ms = rk->rk_conf.socket_timeout_ms;
-
-	/* Convenience Kafka protocol null bytes */
-	rk->rk_null_bytes = rd_kafkap_bytes_new(NULL, 0);
 
 	if (rk->rk_conf.debug)
                 rk->rk_conf.log_level = LOG_DEBUG;
@@ -2211,19 +2348,27 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
         }
 #endif
 
-	/* Client group, eligible both in consumer and producer mode. */
-        if (type == RD_KAFKA_CONSUMER &&
-	    RD_KAFKAP_STR_LEN(rk->rk_group_id) > 0)
-                rk->rk_cgrp = rd_kafka_cgrp_new(rk,
-                                                rk->rk_group_id,
-                                                rk->rk_client_id);
+        if (type == RD_KAFKA_CONSUMER) {
+                rd_kafka_assignment_init(rk);
 
-        if (type == RD_KAFKA_PRODUCER)
+                if (RD_KAFKAP_STR_LEN(rk->rk_group_id) > 0) {
+                        /* Create consumer group handle */
+                        rk->rk_cgrp = rd_kafka_cgrp_new(rk,
+                                                        rk->rk_group_id,
+                                                        rk->rk_client_id);
+                        rk->rk_consumer.q =
+                                rd_kafka_q_keep(rk->rk_cgrp->rkcg_q);
+                } else {
+                        /* Legacy consumer */
+                        rk->rk_consumer.q = rd_kafka_q_keep(rk->rk_rep);
+                }
+
+        } else if (type == RD_KAFKA_PRODUCER) {
                 rk->rk_eos.transactional_id =
-                        rd_kafkap_str_new(rk->rk_conf.eos.transactional_id,
-                                          -1);
+                        rd_kafkap_str_new(rk->rk_conf.eos.transactional_id, -1);
+        }
 
-#ifndef _MSC_VER
+#ifndef _WIN32
         /* Block all signals in newly created threads.
          * To avoid race condition we block all signals in the calling
          * thread, which the new thread will inherit its sigmask from,
@@ -2269,7 +2414,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
                         rd_kafka_wrunlock(rk);
                         mtx_unlock(&rk->rk_init_lock);
 
-#ifndef _MSC_VER
+#ifndef _WIN32
                         /* Restore sigmask of caller */
                         pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
@@ -2298,7 +2443,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
 				    rd_strerror(errno), errno);
 		rd_kafka_wrunlock(rk);
                 mtx_unlock(&rk->rk_init_lock);
-#ifndef _MSC_VER
+#ifndef _WIN32
                 /* Restore sigmask of caller */
                 pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
@@ -2325,7 +2470,7 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
 					"No brokers configured");
 	}
 
-#ifndef _MSC_VER
+#ifndef _WIN32
 	/* Restore sigmask of caller */
 	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 #endif
@@ -2374,6 +2519,18 @@ rd_kafka_t *rd_kafka_new (rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
 
         /* Log warnings for deprecated configuration */
         rd_kafka_conf_warn(rk);
+
+        /* Debug dump configuration */
+        if (rk->rk_conf.debug & RD_KAFKA_DBG_CONF) {
+                rd_kafka_anyconf_dump_dbg(rk, _RK_GLOBAL,
+                                       &rk->rk_conf,
+                                       "Client configuration");
+                if (rk->rk_conf.topic_conf)
+                        rd_kafka_anyconf_dump_dbg(
+                                rk, _RK_TOPIC,
+                                rk->rk_conf.topic_conf,
+                                "Default topic configuration");
+        }
 
         /* Free user supplied conf's base pointer on success,
          * but not the actual allocated fields since the struct
@@ -2531,7 +2688,7 @@ int rd_kafka_consume_start0 (rd_kafka_topic_t *rkt, int32_t partition,
 
 int rd_kafka_consume_start (rd_kafka_topic_t *app_rkt, int32_t partition,
 			    int64_t offset) {
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
         rd_kafka_dbg(rkt->rkt_rk, TOPIC, "START",
                      "Start consuming partition %"PRId32,partition);
  	return rd_kafka_consume_start0(rkt, partition, offset, NULL);
@@ -2539,7 +2696,7 @@ int rd_kafka_consume_start (rd_kafka_topic_t *app_rkt, int32_t partition,
 
 int rd_kafka_consume_start_queue (rd_kafka_topic_t *app_rkt, int32_t partition,
 				  int64_t offset, rd_kafka_queue_t *rkqu) {
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
 
  	return rd_kafka_consume_start0(rkt, partition, offset, rkqu->rkqu_q);
 }
@@ -2572,7 +2729,7 @@ static RD_UNUSED int rd_kafka_consume_stop0 (rd_kafka_toppar_t *rktp) {
 
 
 int rd_kafka_consume_stop (rd_kafka_topic_t *app_rkt, int32_t partition) {
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
 	rd_kafka_toppar_t *rktp;
         int r;
 
@@ -2605,7 +2762,7 @@ rd_kafka_resp_err_t rd_kafka_seek (rd_kafka_topic_t *app_rkt,
                                    int32_t partition,
                                    int64_t offset,
                                    int timeout_ms) {
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
 	rd_kafka_toppar_t *rktp;
         rd_kafka_q_t *tmpq = NULL;
         rd_kafka_resp_err_t err;
@@ -2648,6 +2805,99 @@ rd_kafka_resp_err_t rd_kafka_seek (rd_kafka_topic_t *app_rkt,
 }
 
 
+rd_kafka_error_t *
+rd_kafka_seek_partitions (rd_kafka_t *rk,
+                          rd_kafka_topic_partition_list_t *partitions,
+                          int timeout_ms) {
+        rd_kafka_q_t *tmpq = NULL;
+        rd_kafka_topic_partition_t *rktpar;
+        rd_ts_t abs_timeout = rd_timeout_init(timeout_ms);
+        int cnt = 0;
+
+        if (rk->rk_type != RD_KAFKA_CONSUMER)
+                return rd_kafka_error_new(
+                        RD_KAFKA_RESP_ERR__INVALID_ARG,
+                        "Must only be used on consumer instance");
+
+        if (!partitions || partitions->cnt == 0)
+                return rd_kafka_error_new(RD_KAFKA_RESP_ERR__INVALID_ARG,
+                                          "partitions must be specified");
+
+        if (timeout_ms)
+                tmpq = rd_kafka_q_new(rk);
+
+        RD_KAFKA_TPLIST_FOREACH(rktpar, partitions) {
+                rd_kafka_toppar_t *rktp;
+                rd_kafka_resp_err_t err;
+
+                rktp = rd_kafka_toppar_get2(rk,
+                                            rktpar->topic,
+                                            rktpar->partition,
+                                            rd_false/*no-ua-on-miss*/,
+                                            rd_false/*no-create-on-miss*/);
+                if (!rktp) {
+                        rktpar->err = RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION;
+                        continue;
+                }
+
+                err = rd_kafka_toppar_op_seek(rktp, rktpar->offset,
+                                              RD_KAFKA_REPLYQ(tmpq, 0));
+                if (err) {
+                        rktpar->err = err;
+                } else {
+                        rktpar->err = RD_KAFKA_RESP_ERR__IN_PROGRESS;
+                        cnt++;
+                }
+
+                rd_kafka_toppar_destroy(rktp); /* refcnt from toppar_get2() */
+        }
+
+        if (!timeout_ms)
+                return NULL;
+
+
+        while (cnt > 0) {
+                rd_kafka_op_t *rko;
+
+                rko = rd_kafka_q_pop(tmpq, rd_timeout_remains(abs_timeout), 0);
+                if (!rko) {
+                        rd_kafka_q_destroy_owner(tmpq);
+
+                        return rd_kafka_error_new(
+                                RD_KAFKA_RESP_ERR__TIMED_OUT,
+                                "Timed out waiting for %d remaining partition "
+                                "seek(s) to finish", cnt);
+                }
+
+                if (rko->rko_err == RD_KAFKA_RESP_ERR__DESTROY) {
+                        rd_kafka_q_destroy_owner(tmpq);
+                        rd_kafka_op_destroy(rko);
+
+                        return rd_kafka_error_new(RD_KAFKA_RESP_ERR__DESTROY,
+                                                  "Instance is terminating");
+                }
+
+                rd_assert(rko->rko_rktp);
+
+                rktpar = rd_kafka_topic_partition_list_find(
+                        partitions,
+                        rko->rko_rktp->rktp_rkt->rkt_topic->str,
+                        rko->rko_rktp->rktp_partition);
+                rd_assert(rktpar);
+
+                rktpar->err = rko->rko_err;
+
+                rd_kafka_op_destroy(rko);
+
+                cnt--;
+        }
+
+        rd_kafka_q_destroy_owner(tmpq);
+
+        return NULL;
+}
+
+
 
 static ssize_t rd_kafka_consume_batch0 (rd_kafka_q_t *rkq,
 					int timeout_ms,
@@ -2663,7 +2913,7 @@ ssize_t rd_kafka_consume_batch (rd_kafka_topic_t *app_rkt, int32_t partition,
 				int timeout_ms,
 				rd_kafka_message_t **rkmessages,
 				size_t rkmessages_size) {
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
 	rd_kafka_toppar_t *rktp;
 	ssize_t cnt;
 
@@ -2719,7 +2969,8 @@ rd_kafka_consume_cb (rd_kafka_t *rk,
 	struct consume_ctx *ctx = opaque;
 	rd_kafka_message_t *rkmessage;
 
-        if (unlikely(rd_kafka_op_version_outdated(rko, 0))) {
+        if (unlikely(rd_kafka_op_version_outdated(rko, 0)) ||
+            rko->rko_type == RD_KAFKA_OP_BARRIER) {
                 rd_kafka_op_destroy(rko);
                 return RD_KAFKA_OP_RES_HANDLED;
         }
@@ -2765,7 +3016,7 @@ int rd_kafka_consume_callback (rd_kafka_topic_t *app_rkt, int32_t partition,
 						   *rkmessage,
 						   void *opaque),
 			       void *opaque) {
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
 	rd_kafka_toppar_t *rktp;
 	int r;
 
@@ -2876,7 +3127,7 @@ static rd_kafka_message_t *rd_kafka_consume0 (rd_kafka_t *rk,
 rd_kafka_message_t *rd_kafka_consume (rd_kafka_topic_t *app_rkt,
                                       int32_t partition,
 				      int timeout_ms) {
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
 	rd_kafka_toppar_t *rktp;
 	rd_kafka_message_t *rkmessage;
 
@@ -3040,6 +3291,8 @@ rd_kafka_committed (rd_kafka_t *rk,
                  * processing the op. */
 		rko->rko_u.offset_fetch.partitions =
                         rd_kafka_topic_partition_list_copy(partitions);
+                rko->rko_u.offset_fetch.require_stable =
+                        rk->rk_conf.isolation_level == RD_KAFKA_READ_COMMITTED;
 		rko->rko_u.offset_fetch.do_free = 1;
 
                 if (!rd_kafka_q_enq(rkcg->rkcg_ops, rko)) {
@@ -3078,10 +3331,6 @@ rd_kafka_resp_err_t
 rd_kafka_position (rd_kafka_t *rk,
 		   rd_kafka_topic_partition_list_t *partitions) {
  	int i;
-
-	/* Set default offsets. */
-	rd_kafka_topic_partition_list_reset_offsets(partitions,
-						    RD_KAFKA_OFFSET_INVALID);
 
 	for (i = 0 ; i < partitions->cnt ; i++) {
 		rd_kafka_topic_partition_t *rktpar = &partitions->elems[i];
@@ -3449,15 +3698,16 @@ rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
                 break;
 
         case RD_KAFKA_OP_REBALANCE:
-                /* If EVENT_REBALANCE is enabled but rebalance_cb isnt
-                 * we need to perform a dummy assign for the application.
-                 * This might happen during termination with consumer_close() */
                 if (rk->rk_conf.rebalance_cb)
                         rk->rk_conf.rebalance_cb(
                                 rk, rko->rko_err,
                                 rko->rko_u.rebalance.partitions,
                                 rk->rk_conf.opaque);
                 else {
+                        /** If EVENT_REBALANCE is enabled but rebalance_cb
+                         *  isn't, we need to perform a dummy assign for the
+                         *  application. This might happen during termination
+                         *  with consumer_close() */
                         rd_kafka_dbg(rk, CGRP, "UNASSIGN",
                                      "Forcing unassign of %d partition(s)",
                                      rko->rko_u.rebalance.partitions ?
@@ -3473,6 +3723,11 @@ rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
                         rk, rko->rko_err,
 			rko->rko_u.offset_commit.partitions,
 			rko->rko_u.offset_commit.opaque);
+                break;
+
+        case RD_KAFKA_OP_FETCH_STOP|RD_KAFKA_OP_REPLY:
+                /* Reply from toppar FETCH_STOP */
+                rd_kafka_assignment_partition_stopped(rk, rko->rko_rktp);
                 break;
 
         case RD_KAFKA_OP_CONSUMER_ERR:
@@ -3495,24 +3750,11 @@ rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
 			rk->rk_conf.error_cb(rk, rko->rko_err,
 					     rko->rko_u.err.errstr,
                                              rk->rk_conf.opaque);
-                else {
-                        /* If error string already contains
-                         * the err2str then skip including err2str in
-                         * the printout */
-                        if (rko->rko_u.err.errstr &&
-                            strstr(rko->rko_u.err.errstr,
-                                   rd_kafka_err2str(rko->rko_err)))
-                                rd_kafka_log(rk, LOG_ERR, "ERROR",
-                                             "%s: %s",
-                                             rk->rk_name,
-                                             rko->rko_u.err.errstr);
-                        else
-                                rd_kafka_log(rk, LOG_ERR, "ERROR",
-                                             "%s: %s: %s",
-                                             rk->rk_name,
-                                             rko->rko_u.err.errstr,
-                                             rd_kafka_err2str(rko->rko_err));
-                }
+                else
+                        rd_kafka_log(rk, LOG_ERR, "ERROR",
+                                     "%s: %s",
+                                     rk->rk_name,
+                                     rko->rko_u.err.errstr);
                 break;
 
 	case RD_KAFKA_OP_DR:
@@ -3610,6 +3852,9 @@ rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
         case RD_KAFKA_OP_CREATEPARTITIONS:
         case RD_KAFKA_OP_ALTERCONFIGS:
         case RD_KAFKA_OP_DESCRIBECONFIGS:
+        case RD_KAFKA_OP_DELETERECORDS:
+        case RD_KAFKA_OP_DELETEGROUPS:
+        case RD_KAFKA_OP_ADMIN_FANOUT:
                 /* Calls op_destroy() from worker callback,
                  * when the time comes. */
                 res = rd_kafka_op_call(rk, rkq, rko);
@@ -3627,6 +3872,9 @@ rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
                 /* Must only be handled by rdkafka main thread */
                 rd_assert(thrd_is_current(rk->rk_thread));
                 res = rd_kafka_op_call(rk, rkq, rko);
+                break;
+
+        case RD_KAFKA_OP_BARRIER:
                 break;
 
         case RD_KAFKA_OP_PURGE:
@@ -3982,15 +4230,7 @@ rd_kafka_resp_err_t rd_kafka_flush (rd_kafka_t *rk, int timeout_ms) {
                  * Instead we rely on the application to serve the event
                  * queue in another thread, so all we do here is wait
                  * for the current message count to reach zero. */
-                struct timespec tspec;
-
-                rd_timeout_init_timespec(&tspec, timeout_ms);
-
-                while ((msg_cnt =
-                        rd_kafka_curr_msgs_wait_zero(rk, &tspec)) > 0) {
-                        if (unlikely(rd_kafka_yield_thread))
-                                return RD_KAFKA_RESP_ERR__TIMED_OUT;
-                }
+                rd_kafka_curr_msgs_wait_zero(rk, timeout_ms, &msg_cnt);
 
                 return msg_cnt > 0 ? RD_KAFKA_RESP_ERR__TIMED_OUT :
                         RD_KAFKA_RESP_ERR_NO_ERROR;
@@ -4007,8 +4247,9 @@ rd_kafka_resp_err_t rd_kafka_flush (rd_kafka_t *rk, int timeout_ms) {
 
                 do {
                         rd_kafka_poll(rk, tmout);
-                } while (((qlen = rd_kafka_q_len(rk->rk_rep)) > 0 ||
-                          (msg_cnt = rd_kafka_curr_msgs_cnt(rk)) > 0) &&
+                        qlen = rd_kafka_q_len(rk->rk_rep);
+                        msg_cnt = rd_kafka_curr_msgs_cnt(rk);
+                } while (qlen + msg_cnt > 0 &&
                          !rd_kafka_yield_thread &&
                          (tmout = rd_timeout_remains_limit(ts_end, 10)) !=
                          RD_POLL_NOWAIT);
@@ -4018,6 +4259,47 @@ rd_kafka_resp_err_t rd_kafka_flush (rd_kafka_t *rk, int timeout_ms) {
         }
 }
 
+/**
+ * @brief Purge the partition message queue (according to \p purge_flags) for
+ *        all toppars.
+ *
+ * This is a necessity to avoid the race condition when a purge() is scheduled
+ * shortly in-between an rktp has been created but before it has been
+ * joined to a broker handler thread.
+ *
+ * The rktp_xmit_msgq is handled by the broker-thread purge.
+ *
+ * @returns the number of messages purged.
+ *
+ * @locks_required rd_kafka_*lock()
+ * @locks_acquired rd_kafka_topic_rdlock()
+ */
+static int
+rd_kafka_purge_toppars (rd_kafka_t *rk, int purge_flags) {
+        rd_kafka_topic_t *rkt;
+        int cnt = 0;
+
+        TAILQ_FOREACH(rkt, &rk->rk_topics, rkt_link) {
+                rd_kafka_toppar_t *rktp;
+                int i;
+
+                rd_kafka_topic_rdlock(rkt);
+                for (i = 0 ; i < rkt->rkt_partition_cnt ; i++)
+                        cnt += rd_kafka_toppar_purge_queues(
+                                rkt->rkt_p[i], purge_flags, rd_false/*!xmit*/);
+
+                RD_LIST_FOREACH(rktp, &rkt->rkt_desp, i)
+                        cnt += rd_kafka_toppar_purge_queues(
+                                rktp, purge_flags, rd_false/*!xmit*/);
+
+                if (rkt->rkt_ua)
+                        cnt += rd_kafka_toppar_purge_queues(
+                                rkt->rkt_ua, purge_flags, rd_false/*!xmit*/);
+                rd_kafka_topic_rdunlock(rkt);
+        }
+
+        return cnt;
+}
 
 
 rd_kafka_resp_err_t rd_kafka_purge (rd_kafka_t *rk, int purge_flags) {
@@ -4041,21 +4323,19 @@ rd_kafka_resp_err_t rd_kafka_purge (rd_kafka_t *rk, int purge_flags) {
         if (!(purge_flags & RD_KAFKA_PURGE_F_NON_BLOCKING))
                 tmpq = rd_kafka_q_new(rk);
 
-        /* Send purge request to all broker threads */
         rd_kafka_rdlock(rk);
+
+        /* Purge msgq for all toppars. */
+        rd_kafka_purge_toppars(rk, purge_flags);
+
+        /* Send purge request to all broker threads */
         TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
                 rd_kafka_broker_purge_queues(rkb, purge_flags,
                                              RD_KAFKA_REPLYQ(tmpq, 0));
                 waitcnt++;
         }
-        rd_kafka_rdunlock(rk);
 
-        /* The internal broker handler may hold unassigned partitions */
-        mtx_lock(&rk->rk_internal_rkb_lock);
-        rd_kafka_broker_purge_queues(rk->rk_internal_rkb, purge_flags,
-                                     RD_KAFKA_REPLYQ(tmpq, 0));
-        mtx_unlock(&rk->rk_internal_rkb_lock);
-        waitcnt++;
+        rd_kafka_rdunlock(rk);
 
 
         if (tmpq) {
@@ -4419,7 +4699,7 @@ rd_kafka_list_groups (rd_kafka_t *rk, const char *group,
         /* Query each broker for its list of groups */
         TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
                 rd_kafka_broker_lock(rkb);
-                if (rkb->rkb_nodeid == -1) {
+                if (rkb->rkb_nodeid == -1 || RD_KAFKA_BROKER_IS_LOGICAL(rkb)) {
                         rd_kafka_broker_unlock(rkb);
                         continue;
                 }
@@ -4523,7 +4803,7 @@ const char *rd_kafka_get_debug_contexts(void) {
 
 
 int rd_kafka_path_is_dir (const char *path) {
-#ifdef _MSC_VER
+#ifdef _WIN32
 	struct _stat st;
 	return (_stat(path, &st) == 0 && st.st_mode & S_IFDIR);
 #else
@@ -4533,8 +4813,50 @@ int rd_kafka_path_is_dir (const char *path) {
 }
 
 
+/**
+ * @returns true if directory is empty or can't be accessed, else false.
+ */
+rd_bool_t rd_kafka_dir_is_empty (const char *path) {
+#if _WIN32
+        /* FIXME: Unsupported */
+        return rd_true;
+#else
+        DIR *dir;
+        struct dirent *d;
+
+        dir = opendir(path);
+        if (!dir)
+                return rd_true;
+
+        while ((d = readdir(dir))) {
+
+                if (!strcmp(d->d_name, ".") ||
+                    !strcmp(d->d_name, ".."))
+                        continue;
+
+                if (d->d_type == DT_REG || d->d_type == DT_LNK ||
+                    d->d_type == DT_DIR) {
+                        closedir(dir);
+                        return rd_false;
+                }
+        }
+
+        closedir(dir);
+        return rd_true;
+#endif
+}
+
+
+void *rd_kafka_mem_malloc (rd_kafka_t *rk, size_t size) {
+        return rd_malloc(size);
+}
+
+void *rd_kafka_mem_calloc(rd_kafka_t *rk, size_t num, size_t size) {
+        return rd_calloc(num, size);
+}
+
 void rd_kafka_mem_free (rd_kafka_t *rk, void *ptr) {
-        free(ptr);
+        rd_free(ptr);
 }
 
 

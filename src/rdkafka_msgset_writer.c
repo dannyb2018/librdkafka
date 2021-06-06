@@ -313,7 +313,7 @@ rd_kafka_msgset_writer_alloc_buf (rd_kafka_msgset_writer_t *msetw) {
 
         case 2:
                 /* MsgVer2 uses varints, we calculate for the worst-case. */
-                msg_overhead += RD_KAFKAP_MESSAGE_V2_OVERHEAD;
+                msg_overhead += RD_KAFKAP_MESSAGE_V2_MAX_OVERHEAD;
 
                 /* MessageSet header fields */
                 msgsetsize +=
@@ -497,7 +497,8 @@ static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
                                         rd_kafka_broker_t *rkb,
                                         rd_kafka_toppar_t *rktp,
                                         rd_kafka_msgq_t *rkmq,
-                                        rd_kafka_pid_t pid) {
+                                        rd_kafka_pid_t pid,
+                                        uint64_t epoch_base_msgid) {
         int msgcnt = rd_kafka_msgq_len(rkmq);
 
         if (msgcnt == 0)
@@ -536,7 +537,7 @@ static int rd_kafka_msgset_writer_init (rd_kafka_msgset_writer_t *msetw,
                                                     rkbuf_buf);
 
         rd_kafka_msgbatch_init(&msetw->msetw_rkbuf->rkbuf_u.Produce.batch,
-                               rktp, pid);
+                               rktp, pid, epoch_base_msgid);
         msetw->msetw_batch = &msetw->msetw_rkbuf->rkbuf_u.Produce.batch;
 
         return msetw->msetw_msgcntmax;
@@ -1456,11 +1457,13 @@ rd_kafka_msgset_create_ProduceRequest (rd_kafka_broker_t *rkb,
                                        rd_kafka_toppar_t *rktp,
                                        rd_kafka_msgq_t *rkmq,
                                        const rd_kafka_pid_t pid,
+                                       uint64_t epoch_base_msgid,
                                        size_t *MessageSetSizep) {
 
         rd_kafka_msgset_writer_t msetw;
 
-        if (rd_kafka_msgset_writer_init(&msetw, rkb, rktp, rkmq, pid) <= 0)
+        if (rd_kafka_msgset_writer_init(&msetw, rkb, rktp, rkmq,
+                                        pid, epoch_base_msgid) <= 0)
                 return NULL;
 
         if (!rd_kafka_msgset_writer_write_msgq(&msetw, msetw.msetw_msgq)) {

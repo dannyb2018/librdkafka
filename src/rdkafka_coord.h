@@ -81,7 +81,9 @@ typedef struct rd_kafka_coord_req_s {
         rd_kafka_coordtype_t creq_coordtype; /**< Coordinator type */
         char                *creq_coordkey;  /**< Coordinator key */
 
-        rd_kafka_op_t *creq_rko;             /**< FIXME? */
+        rd_kafka_op_t *creq_rko;             /**< Requester's rko that is
+                                              *   provided to creq_send_req_cb
+                                              *   (optional). */
         rd_ts_t        creq_ts_timeout;      /**< Absolute timeout.
                                               *   Will fail with an error
                                               *   code pertaining to the
@@ -95,7 +97,18 @@ typedef struct rd_kafka_coord_req_s {
                                               *   request sent by
                                               *   send_req_cb */
         void               *creq_reply_opaque; /**< Opaque passed to
-                                                *   resp_cb */
+                                                *   creq_send_req_cb and
+                                                *   creq_resp_cb. */
+
+        int                 creq_refcnt;     /**< Internal reply queue for
+                                              *   FindCoordinator requests
+                                              *   which is forwarded to the
+                                              *   rk_ops queue, but allows
+                                              *   destroying the creq even
+                                              *   with outstanding
+                                              *   FindCoordinator requests. */
+        rd_bool_t           creq_done;      /**< True if request was sent */
+
 } rd_kafka_coord_req_t;
 
 

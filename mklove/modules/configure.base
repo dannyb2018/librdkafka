@@ -523,6 +523,7 @@ function mkl_resolve_static_libs {
 
     if [[ -z $stlibfnames || -n "${!stlibvar}" ]]; then
         mkl_dbg "$name: not resolving static libraries (stlibfnames=$stlibfnames, $stlibvar=${!stlibvar})"
+        mkl_allvar_set "$name" "WITH_STATIC_LIB_$name" y
         return 1
     fi
 
@@ -542,6 +543,7 @@ function mkl_resolve_static_libs {
     if [[ -n $stlibs ]]; then
         mkl_dbg "$name: $stlibvar: found static libs: $stlibs"
         mkl_var_set $stlibvar "$stlibs" "cache"
+        mkl_allvar_set "$name" "WITH_STATIC_LIB_$name" y
         return 0
     else
         mkl_dbg "$name: did not find any static libraries for $stlibfnames in ${scandir}"
@@ -910,7 +912,7 @@ Configuration summary:"
     local n=
     for n in $MKL_MKVARS ; do
         # Skip the boring booleans
-        if [[ $n == WITH_* || $n == WITHOUT_* || $n == HAVE_* || $n == def_* ]]; then
+        if [[ $n == ENABLE_* || $n == WITH_* || $n == WITHOUT_* || $n == HAVE_* || $n == def_* ]]; then
             continue
         fi
         printf "  %-24s %s\n" "$n" "${!n}"
@@ -1133,7 +1135,8 @@ function mkl_cache_read {
     IFS="$IFS="
     while read -r n v ; do
         [[ -z $n || $n = \#* || -z $v ]] && continue
-        mkl_var_set $n $v cache
+        # Don't let cache overwrite variables
+        [[ -n ${n+r} ]] || mkl_var_set $n $v cache
     done < config.cache
     IFS=$ORIG_IFS
 }
@@ -1244,10 +1247,8 @@ function mkl_check_begin {
 # certain call ordering, such as dependent library checks.
 #
 # Param 1: module name
-# Param 2: action
 function mkl_check {
     local modname=$1
-    local action=$2
 
     local func="${modname}_manual_checks"
     if ! mkl_func_exists "$func" ; then
@@ -1255,7 +1256,7 @@ function mkl_check {
         return 1
     fi
 
-    $func "$2"
+    $func
     return $?
 }
 
@@ -1559,11 +1560,13 @@ function mkl_lib_check0 {
     fi
 
     local libs="$5"
+    local is_static=0
 
     if [[ -z $nostaticopt ]]; then
         local stlibs=$(mkl_lib_check_static $1 "$libs")
         if [[ -n $stlibs ]]; then
             libs=$stlibs
+            is_static=1
         fi
     fi
 
@@ -1577,6 +1580,12 @@ function mkl_lib_check0 {
         # E.g., check for crypto and then ssl should result in -lssl -lcrypto
         mkl_dbg "$1: from lib_check: LIBS: prepend $libs"
         mkl_mkvar_prepend "$1" LIBS "$libs"
+        if [[ $is_static == 0 ]]; then
+            # Static libraries are automatically bundled with
+            # librdkafka-static.a so there is no need to add them as an
+            # external linkage dependency.
+            mkl_mkvar_prepend "$1" MKL_PKGCONFIG_LIBS_PRIVATE "$libs"
+        fi
     fi
 
     return 0
@@ -1714,12 +1723,19 @@ $cflags"
         fi
     fi
 
+    mkl_mkvar_append $1 "MKL_PKGCONFIG_REQUIRES_PRIVATE" "$libname"
+
     mkl_mkvar_append $1 "CFLAGS" "$cflags"
 
     if [[ -z $nostaticopt ]]; then
         local stlibs=$(mkl_lib_check_static $1 "$libs")
         if [[ -n $stlibs ]]; then
             libs=$stlibs
+        else
+            # if we don't find a static library to bundle into the
+            # -static.a, we need to export a pkgconfig dependency
+            # so it can be resolved when linking downstream packages
+            mkl_mkvar_append $1 "MKL_PKGCONFIG_REQUIRES" "$libname"
         fi
     fi
 
@@ -2150,7 +2166,7 @@ function mkl_usage {
 
     echo "Honoured environment variables:
   CC, CPP, CXX, CFLAGS, CPPFLAGS, CXXFLAGS, LDFLAGS, LIBS,
-  LD, NM, OBJDUMP, STRIP, PKG_CONFIG, PKG_CONFIG_PATH,
+  LD, NM, OBJDUMP, STRIP, RANLIB, PKG_CONFIG, PKG_CONFIG_PATH,
   STATIC_LIB_<libname>=.../libname.a
 
 "
@@ -2172,11 +2188,13 @@ $1"
 # Arguments:
 #  option group ("Standard", "Cross-Compilation", etc..)
 #  variable name
-#  option ("--foo=feh")
+#  option ("--foo", "--foo=*", "--foo=args_required")
 #  help
 #  default (optional)
 #  assignvalue (optional, default:"y")
 #  function block (optional)
+#
+# If option takes the form --foo=* then arguments are optional.
 function mkl_option {
     local optgroup=$1
     local varname=$2
@@ -2208,6 +2226,10 @@ function mkl_option {
     if [[ $3 == *=* ]]; then
         optname="${optname%=*}"
         optval="${3#*=}"
+        if [[ $optval == '*' ]]; then
+            # Avoid globbing of --foo=* optional arguments
+            optval='\*'
+        fi
     fi
 
     safeopt=$(mkl_env_esc $optname)
@@ -2284,7 +2306,7 @@ function mkl_option {
 # Arguments:
 #  option group   ("Standard", ..)
 #  variable name  (WITH_FOO)
-#  option         (--enable-foo)
+#  option         (--enable-foo, --enable-foo=*, or --enable-foo=req)
 #  help           ("foo.." ("Enable" and "Disable" will be prepended))
 #  default        (y or n)
 
@@ -2328,8 +2350,3 @@ function mkl_toggle_option_lib {
     eval "function _tmp_func { mkl_lib_check \"$2\" \"$3\" \"$4\" CC \"$7\"; }"
     mkl_func_push MKL_CHECKS "$MKL_MODULE" _tmp_func
 }
-
-
-
-
-

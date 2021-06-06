@@ -29,11 +29,14 @@
 #ifndef _RDKAFKA_INT_H_
 #define _RDKAFKA_INT_H_
 
-#ifndef _MSC_VER
+#ifndef _WIN32
 #define _GNU_SOURCE  /* for strndup() */
-#else
+#endif
+
+#ifdef _MSC_VER
 typedef int mode_t;
 #endif
+
 #include <fcntl.h>
 
 
@@ -53,10 +56,6 @@ typedef int mode_t;
 #endif
 
 
-
-
-typedef struct rd_kafka_topic_s rd_kafka_topic_t;
-typedef struct rd_ikafka_s rd_ikafka_t;
 
 
 #define rd_kafka_assert(rk, cond) do {                                  \
@@ -79,6 +78,8 @@ struct rd_kafka_msg_s;
 struct rd_kafka_broker_s;
 struct rd_kafka_toppar_s;
 
+typedef struct rd_kafka_lwtopic_s rd_kafka_lwtopic_t;
+
 
 #include "rdkafka_op.h"
 #include "rdkafka_queue.h"
@@ -93,6 +94,7 @@ struct rd_kafka_toppar_s;
 #include "rdkafka_metadata.h"
 #include "rdkafka_mock.h"
 #include "rdkafka_partition.h"
+#include "rdkafka_assignment.h"
 #include "rdkafka_coord.h"
 #include "rdkafka_mock.h"
 
@@ -173,8 +175,14 @@ typedef enum {
         /**< commit_transaction() has been called and all outstanding
          *   messages, partitions, and offsets have been sent. */
         RD_KAFKA_TXN_STATE_COMMITTING_TRANSACTION,
+        /**< Transaction successfully committed but application has not made
+         *   a successful commit_transaction() call yet. */
+        RD_KAFKA_TXN_STATE_COMMIT_NOT_ACKED,
         /**< abort_transaction() has been called. */
         RD_KAFKA_TXN_STATE_ABORTING_TRANSACTION,
+        /**< Transaction successfully aborted but application has not made
+         *   a successful abort_transaction() call yet. */
+        RD_KAFKA_TXN_STATE_ABORT_NOT_ACKED,
         /**< An abortable error has occurred. */
         RD_KAFKA_TXN_STATE_ABORTABLE_ERROR,
         /* A fatal error has occured. */
@@ -195,7 +203,9 @@ rd_kafka_txn_state2str (rd_kafka_txn_state_t state) {
                 "InTransaction",
                 "BeginCommit",
                 "CommittingTransaction",
+                "CommitNotAcked",
                 "AbortingTransaction",
+                "AbortedNotAcked",
                 "AbortableError",
                 "FatalError"
         };
@@ -387,6 +397,10 @@ struct rd_kafka_s {
                                                           *   take action when
                                                           *   the broker state
                                                           *   changes. */
+                rd_bool_t txn_requires_epoch_bump; /**< Coordinator epoch bump
+                                                    *   required to recover from
+                                                    *   idempotent producer
+                                                    *   fatal error. */
 
                 /**< Blocking transactional API application call
                  *   currently being handled, its state, reply queue and how
@@ -469,6 +483,12 @@ struct rd_kafka_s {
                 /**< Partitions added and registered to transaction. */
                 rd_kafka_toppar_tqhead_t txn_rktps;
 
+                /**< Number of messages that failed delivery.
+                 *   If this number is >0 on transaction_commit then an
+                 *   abortable transaction error will be raised.
+                 *   Is reset to zero on each begin_transaction(). */
+                rd_atomic64_t txn_dr_fails;
+
                 /**< Current transaction error. */
                 rd_kafka_resp_err_t txn_err;
 
@@ -485,6 +505,23 @@ struct rd_kafka_s {
                 rd_kafka_timer_t    txn_coord_tmr;
         } rk_eos;
 
+
+        /**
+         * Consumer state
+         *
+         * @locality rdkafka main thread
+         * @locks_required none
+         */
+        struct {
+                /** Application consumer queue for messages, events and errors.
+                 *  (typically points to rkcg_q) */
+                rd_kafka_q_t *q;
+                /** Current assigned partitions through assign() et.al. */
+                rd_kafka_assignment_t assignment;
+                /** Waiting for this number of commits to finish. */
+                int wait_commit_cnt;
+        } rk_consumer;
+
         /**<
          * Coordinator cache.
          *
@@ -496,7 +533,6 @@ struct rd_kafka_s {
         TAILQ_HEAD(, rd_kafka_coord_req_s) rk_coord_reqs; /**< Coordinator
                                                            *   requests */
 
-	const rd_kafkap_bytes_t *rk_null_bytes;
 
 	struct {
 		mtx_t lock;       /* Protects acces to this struct */
@@ -519,6 +555,9 @@ struct rd_kafka_s {
                                    *   to finish its initialization before
                                    *   before rd_kafka_new() returns. */
         mtx_t rk_init_lock;       /**< Lock for rk_init_wait and _cmd */
+
+        rd_ts_t rk_ts_created;    /**< Timestamp (monotonic clock) of
+                                   *   rd_kafka_t creation. */
 
         /**
          * Background thread and queue,
@@ -560,6 +599,10 @@ struct rd_kafka_s {
                  *   but no more often than every 10s.
                  *   No locks: only accessed by rdkafka main thread. */
                 rd_interval_t broker_metadata_refresh;
+
+                /**< Suppression for allow.auto.create.topics=false not being
+                 *   supported by the broker. */
+                rd_interval_t allow_auto_create_topics;
         } rk_suppress;
 
         struct {
@@ -702,21 +745,28 @@ rd_kafka_curr_msgs_cnt (rd_kafka_t *rk) {
 /**
  * @brief Wait until \p tspec for curr_msgs to reach 0.
  *
- * @returns remaining curr_msgs
+ * @returns rd_true if zero is reached, or rd_false on timeout.
+ *          The remaining messages are returned in \p *curr_msgsp
  */
-static RD_INLINE RD_UNUSED int
-rd_kafka_curr_msgs_wait_zero (rd_kafka_t *rk, const struct timespec *tspec) {
-        int cnt;
+static RD_INLINE RD_UNUSED rd_bool_t
+rd_kafka_curr_msgs_wait_zero (rd_kafka_t *rk, int timeout_ms,
+                              unsigned int *curr_msgsp) {
+        unsigned int cnt;
+        struct timespec tspec;
+
+        rd_timeout_init_timespec(&tspec, timeout_ms);
 
         mtx_lock(&rk->rk_curr_msgs.lock);
         while ((cnt = rk->rk_curr_msgs.cnt) > 0) {
-                cnd_timedwait_abs(&rk->rk_curr_msgs.cnd,
-                                  &rk->rk_curr_msgs.lock,
-                                  tspec);
+                if (cnd_timedwait_abs(&rk->rk_curr_msgs.cnd,
+                                      &rk->rk_curr_msgs.lock,
+                                      &tspec) == thrd_timedout)
+                        break;
         }
         mtx_unlock(&rk->rk_curr_msgs.lock);
 
-        return cnt;
+        *curr_msgsp = cnt;
+        return cnt == 0;
 }
 
 void rd_kafka_destroy_final (rd_kafka_t *rk);
@@ -807,47 +857,59 @@ const char *rd_kafka_purge_flags2str (int flags);
 #define RD_KAFKA_DBG_ADMIN          0x4000
 #define RD_KAFKA_DBG_EOS            0x8000
 #define RD_KAFKA_DBG_MOCK           0x10000
+#define RD_KAFKA_DBG_ASSIGNOR       0x20000
+#define RD_KAFKA_DBG_CONF           0x40000
 #define RD_KAFKA_DBG_ALL            0xfffff
 #define RD_KAFKA_DBG_NONE           0x0
 
+
 void rd_kafka_log0(const rd_kafka_conf_t *conf,
                    const rd_kafka_t *rk, const char *extra, int level,
+                   int ctx,
                    const char *fac, const char *fmt, ...) RD_FORMAT(printf,
-                                                                    6, 7);
+                                                                    7, 8);
 
-#define rd_kafka_log(rk,level,fac,...) \
-        rd_kafka_log0(&rk->rk_conf, rk, NULL, level, fac, __VA_ARGS__)
-#define rd_kafka_dbg(rk,ctx,fac,...) do {                               \
+#define rd_kafka_log(rk,level,fac,...)               \
+        rd_kafka_log0(&rk->rk_conf, rk, NULL, level, \
+                RD_KAFKA_DBG_NONE, fac, __VA_ARGS__)
+
+#define rd_kafka_dbg(rk,ctx,fac,...) do {                                   \
                 if (unlikely((rk)->rk_conf.debug & (RD_KAFKA_DBG_ ## ctx))) \
-                        rd_kafka_log0(&rk->rk_conf,rk,NULL,             \
-                                      LOG_DEBUG,fac,__VA_ARGS__);       \
+                        rd_kafka_log0(&rk->rk_conf,rk,NULL,                 \
+                                      LOG_DEBUG,(RD_KAFKA_DBG_ ## ctx),     \
+                                      fac,__VA_ARGS__);                     \
         } while (0)
 
 /* dbg() not requiring an rk, just the conf object, for early logging */
 #define rd_kafka_dbg0(conf,ctx,fac,...) do {                            \
                 if (unlikely((conf)->debug & (RD_KAFKA_DBG_ ## ctx)))   \
                         rd_kafka_log0(conf,NULL,NULL,                   \
-                                      LOG_DEBUG,fac,__VA_ARGS__);       \
+                                      LOG_DEBUG,(RD_KAFKA_DBG_ ## ctx), \
+                                      fac,__VA_ARGS__);                 \
         } while (0)
 
 /* NOTE: The local copy of _logname is needed due rkb_logname_lock lock-ordering
  *       when logging another broker's name in the message. */
-#define rd_rkb_log(rkb,level,fac,...) do {				\
-		char _logname[RD_KAFKA_NODENAME_SIZE];			\
-                mtx_lock(&(rkb)->rkb_logname_lock);                     \
+#define rd_rkb_log0(rkb,level,ctx,fac,...) do {                           \
+        char _logname[RD_KAFKA_NODENAME_SIZE];                            \
+                mtx_lock(&(rkb)->rkb_logname_lock);                       \
                 rd_strlcpy(_logname, rkb->rkb_logname, sizeof(_logname)); \
-                mtx_unlock(&(rkb)->rkb_logname_lock);                   \
-		rd_kafka_log0(&(rkb)->rkb_rk->rk_conf, \
-                              (rkb)->rkb_rk, _logname,                  \
-                              level, fac, __VA_ARGS__);                 \
+                mtx_unlock(&(rkb)->rkb_logname_lock);                     \
+        rd_kafka_log0(&(rkb)->rkb_rk->rk_conf,                            \
+                              (rkb)->rkb_rk, _logname,                    \
+                              level, ctx, fac, __VA_ARGS__);              \
         } while (0)
 
-#define rd_rkb_dbg(rkb,ctx,fac,...) do {				\
-		if (unlikely((rkb)->rkb_rk->rk_conf.debug &		\
-			     (RD_KAFKA_DBG_ ## ctx))) {			\
-			rd_rkb_log(rkb, LOG_DEBUG, fac, __VA_ARGS__);	\
-                }                                                       \
-	} while (0)
+#define rd_rkb_log(rkb,level,fac,...) \
+        rd_rkb_log0(rkb,level,RD_KAFKA_DBG_NONE,fac, __VA_ARGS__)
+
+#define rd_rkb_dbg(rkb,ctx,fac,...) do {                       \
+        if (unlikely((rkb)->rkb_rk->rk_conf.debug &            \
+                 (RD_KAFKA_DBG_ ## ctx))) {                    \
+            rd_rkb_log0(rkb, LOG_DEBUG,(RD_KAFKA_DBG_ ## ctx), \
+                    fac, __VA_ARGS__);                         \
+                }                                              \
+        } while (0)
 
 
 
@@ -894,10 +956,11 @@ rd_kafka_fatal_error_code (rd_kafka_t *rk) {
 extern rd_atomic32_t rd_kafka_thread_cnt_curr;
 extern char RD_TLS rd_kafka_thread_name[64];
 
-void rd_kafka_set_thread_name (const char *fmt, ...);
-void rd_kafka_set_thread_sysname (const char *fmt, ...);
+void rd_kafka_set_thread_name (const char *fmt, ...) RD_FORMAT(printf, 1, 2);
+void rd_kafka_set_thread_sysname (const char *fmt, ...) RD_FORMAT(printf, 1, 2);
 
 int rd_kafka_path_is_dir (const char *path);
+rd_bool_t rd_kafka_dir_is_empty (const char *path);
 
 rd_kafka_op_res_t
 rd_kafka_poll_cb (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,

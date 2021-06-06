@@ -35,6 +35,7 @@
 #include "rdkafka_header.h"
 #include "rdkafka_idempotence.h"
 #include "rdkafka_txnmgr.h"
+#include "rdkafka_error.h"
 #include "rdcrc32.h"
 #include "rdfnv1a.h"
 #include "rdmurmur2.h"
@@ -46,32 +47,66 @@
 #include <stdarg.h>
 
 
+const char *rd_kafka_message_errstr (const rd_kafka_message_t *rkmessage) {
+        if (!rkmessage->err)
+                return NULL;
+
+        if (rkmessage->payload)
+                return (const char *)rkmessage->payload;
+
+        return rd_kafka_err2str(rkmessage->err);
+}
+
+
 /**
  * @brief Check if producing is allowed.
+ *
+ * @param errorp If non-NULL and an producing is prohibited a new error_t
+ *               object will be allocated and returned in this pointer.
  *
  * @returns an error if not allowed, else 0.
  *
  * @remarks Also sets the corresponding errno.
  */
-static RD_INLINE rd_kafka_resp_err_t rd_kafka_check_produce (rd_kafka_t *rk) {
+static RD_INLINE rd_kafka_resp_err_t
+rd_kafka_check_produce (rd_kafka_t *rk, rd_kafka_error_t **errorp) {
+        rd_kafka_resp_err_t err;
 
-        if (unlikely(rd_kafka_fatal_error_code(rk))) {
+        if (unlikely((err = rd_kafka_fatal_error_code(rk)))) {
                 rd_kafka_set_last_error(RD_KAFKA_RESP_ERR__FATAL, ECANCELED);
+                if (errorp) {
+                        rd_kafka_rdlock(rk);
+                        *errorp = rd_kafka_error_new_fatal(
+                                err,
+                                "Producing not allowed since a previous fatal "
+                                "error was raised: %s",
+                                rk->rk_fatal.errstr);
+                        rd_kafka_rdunlock(rk);
+                }
                 return RD_KAFKA_RESP_ERR__FATAL;
         }
 
-        if (rd_kafka_txn_may_enq_msg(rk))
+        if (likely(rd_kafka_txn_may_enq_msg(rk)))
                 return RD_KAFKA_RESP_ERR_NO_ERROR;
 
         /* Transactional state forbids producing */
         rd_kafka_set_last_error(RD_KAFKA_RESP_ERR__STATE, ENOEXEC);
+
+        if (errorp) {
+                rd_kafka_rdlock(rk);
+                *errorp = rd_kafka_error_new(
+                        RD_KAFKA_RESP_ERR__STATE,
+                        "Producing not allowed in transactional state %s",
+                        rd_kafka_txn_state2str(rk->rk_eos.txn_state));
+                rd_kafka_rdunlock(rk);
+        }
 
         return RD_KAFKA_RESP_ERR__STATE;
 }
 
 
 void rd_kafka_msg_destroy (rd_kafka_t *rk, rd_kafka_msg_t *rkm) {
-
+//FIXME
 	if (rkm->rkm_flags & RD_KAFKA_MSG_F_ACCOUNT) {
 		rd_dassert(rk || rkm->rkm_rkmessage.rkt);
 		rd_kafka_curr_msgs_sub(
@@ -130,6 +165,7 @@ rd_kafka_msg_t *rd_kafka_msg_new00 (rd_kafka_topic_t *rkt,
 	rkm->rkm_opaque     = msg_opaque;
 	rkm->rkm_rkmessage.rkt = rd_kafka_topic_keep(rkt);
 
+        rkm->rkm_broker_id  = -1;
 	rkm->rkm_partition  = partition;
         rkm->rkm_offset     = RD_KAFKA_OFFSET_INVALID;
 	rkm->rkm_timestamp  = 0;
@@ -272,7 +308,7 @@ int rd_kafka_msg_new (rd_kafka_topic_t *rkt, int32_t force_partition,
 	rd_kafka_resp_err_t err;
 	int errnox;
 
-        if (unlikely((err = rd_kafka_check_produce(rkt->rkt_rk))))
+        if (unlikely((err = rd_kafka_check_produce(rkt->rkt_rk, NULL))))
                 return -1;
 
         /* Create message */
@@ -319,6 +355,188 @@ int rd_kafka_msg_new (rd_kafka_topic_t *rkt, int32_t force_partition,
 }
 
 
+/** @remark Keep rd_kafka_produceva() and rd_kafka_producev() in synch */
+rd_kafka_error_t *rd_kafka_produceva (rd_kafka_t *rk,
+                                      const rd_kafka_vu_t *vus,
+                                      size_t cnt) {
+        rd_kafka_msg_t s_rkm = {
+                /* Message defaults */
+                .rkm_partition = RD_KAFKA_PARTITION_UA,
+                .rkm_timestamp = 0, /* current time */
+        };
+        rd_kafka_msg_t *rkm = &s_rkm;
+        rd_kafka_topic_t *rkt = NULL;
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
+        rd_kafka_error_t *error = NULL;
+        rd_kafka_headers_t *hdrs = NULL;
+        rd_kafka_headers_t *app_hdrs = NULL; /* App-provided headers list */
+        size_t i;
+
+        if (unlikely(rd_kafka_check_produce(rk, &error)))
+                return error;
+
+        for (i = 0 ; i < cnt ; i++) {
+                const rd_kafka_vu_t *vu = &vus[i];
+                switch (vu->vtype)
+                {
+                case RD_KAFKA_VTYPE_TOPIC:
+                        rkt = rd_kafka_topic_new0(rk,
+                                                  vu->u.cstr,
+                                                  NULL, NULL, 1);
+                        break;
+
+                case RD_KAFKA_VTYPE_RKT:
+                        rkt = rd_kafka_topic_proper(vu->u.rkt);
+                        rd_kafka_topic_keep(rkt);
+                        break;
+
+                case RD_KAFKA_VTYPE_PARTITION:
+                        rkm->rkm_partition = vu->u.i32;
+                        break;
+
+                case RD_KAFKA_VTYPE_VALUE:
+                        rkm->rkm_payload = vu->u.mem.ptr;
+                        rkm->rkm_len = vu->u.mem.size;
+                        break;
+
+                case RD_KAFKA_VTYPE_KEY:
+                        rkm->rkm_key = vu->u.mem.ptr;
+                        rkm->rkm_key_len = vu->u.mem.size;
+                        break;
+
+                case RD_KAFKA_VTYPE_OPAQUE:
+                        rkm->rkm_opaque = vu->u.ptr;
+                        break;
+
+                case RD_KAFKA_VTYPE_MSGFLAGS:
+                        rkm->rkm_flags = vu->u.i;
+                        break;
+
+                case RD_KAFKA_VTYPE_TIMESTAMP:
+                        rkm->rkm_timestamp = vu->u.i64;
+                        break;
+
+                case RD_KAFKA_VTYPE_HEADER:
+                        if (unlikely(app_hdrs != NULL)) {
+                                error = rd_kafka_error_new(
+                                        RD_KAFKA_RESP_ERR__CONFLICT,
+                                        "VTYPE_HEADER and VTYPE_HEADERS "
+                                        "are mutually exclusive");
+                                goto err;
+                        }
+
+                        if (unlikely(!hdrs))
+                                hdrs = rd_kafka_headers_new(8);
+
+                        err = rd_kafka_header_add(hdrs,
+                                                  vu->u.header.name, -1,
+                                                  vu->u.header.val,
+                                                  vu->u.header.size);
+                        if (unlikely(err)) {
+                                error = rd_kafka_error_new(
+                                        err,
+                                        "Failed to add header: %s",
+                                        rd_kafka_err2str(err));
+                                goto err;
+                        }
+                        break;
+
+                case RD_KAFKA_VTYPE_HEADERS:
+                        if (unlikely(hdrs != NULL)) {
+                                error = rd_kafka_error_new(
+                                        RD_KAFKA_RESP_ERR__CONFLICT,
+                                        "VTYPE_HEADERS and VTYPE_HEADER "
+                                        "are mutually exclusive");
+                                goto err;
+                        }
+                        app_hdrs = vu->u.headers;
+                        break;
+
+                default:
+                        error = rd_kafka_error_new(
+                                RD_KAFKA_RESP_ERR__INVALID_ARG,
+                                "Unsupported VTYPE %d", (int)vu->vtype);
+                        goto err;
+                }
+        }
+
+        rd_assert(!error);
+
+        if (unlikely(!rkt)) {
+                error = rd_kafka_error_new(
+                        RD_KAFKA_RESP_ERR__INVALID_ARG,
+                        "Topic name or object required");
+                goto err;
+        }
+
+        rkm = rd_kafka_msg_new0(rkt,
+                                rkm->rkm_partition,
+                                rkm->rkm_flags,
+                                rkm->rkm_payload, rkm->rkm_len,
+                                rkm->rkm_key, rkm->rkm_key_len,
+                                rkm->rkm_opaque,
+                                &err, NULL,
+                                app_hdrs ? app_hdrs : hdrs,
+                                rkm->rkm_timestamp,
+                                rd_clock());
+
+        if (unlikely(err)) {
+                error = rd_kafka_error_new(
+                        err,
+                        "Failed to produce message: %s",
+                        rd_kafka_err2str(err));
+                goto err;
+        }
+
+        /* Partition the message */
+        err = rd_kafka_msg_partitioner(rkt, rkm, 1);
+        if (unlikely(err)) {
+                /* Handle partitioner failures: it only fails when
+                 * the application attempts to force a destination
+                 * partition that does not exist in the cluster. */
+
+                /* Interceptors: Unroll on_send by on_ack.. */
+                rkm->rkm_err = err;
+                rd_kafka_interceptors_on_acknowledgement(rk,
+                                                         &rkm->rkm_rkmessage);
+
+                /* Note we must clear the RD_KAFKA_MSG_F_FREE
+                 * flag since our contract says we don't free the payload on
+                 * failure. */
+                rkm->rkm_flags &= ~RD_KAFKA_MSG_F_FREE;
+
+                /* Deassociate application owned headers from message
+                 * since headers remain in application ownership
+                 * when producev() fails */
+                if (app_hdrs && app_hdrs == rkm->rkm_headers)
+                        rkm->rkm_headers = NULL;
+
+                rd_kafka_msg_destroy(rk, rkm);
+
+                error = rd_kafka_error_new(err,
+                                           "Failed to enqueue message: %s",
+                                           rd_kafka_err2str(err));
+                goto err;
+        }
+
+        rd_kafka_topic_destroy0(rkt);
+
+        return NULL;
+
+ err:
+        if (rkt)
+                rd_kafka_topic_destroy0(rkt);
+
+        if (hdrs)
+                rd_kafka_headers_destroy(hdrs);
+
+        rd_assert(error != NULL);
+        return error;
+}
+
+
+
+/** @remark Keep rd_kafka_produceva() and rd_kafka_producev() in synch */
 rd_kafka_resp_err_t rd_kafka_producev (rd_kafka_t *rk, ...) {
         va_list ap;
         rd_kafka_msg_t s_rkm = {
@@ -328,13 +546,12 @@ rd_kafka_resp_err_t rd_kafka_producev (rd_kafka_t *rk, ...) {
         };
         rd_kafka_msg_t *rkm = &s_rkm;
         rd_kafka_vtype_t vtype;
-        rd_kafka_topic_t *app_rkt;
         rd_kafka_topic_t *rkt = NULL;
         rd_kafka_resp_err_t err;
         rd_kafka_headers_t *hdrs = NULL;
         rd_kafka_headers_t *app_hdrs = NULL; /* App-provided headers list */
 
-        if (unlikely((err = rd_kafka_check_produce(rk))))
+        if (unlikely((err = rd_kafka_check_produce(rk, NULL))))
                 return err;
 
         va_start(ap, rk);
@@ -349,8 +566,9 @@ rd_kafka_resp_err_t rd_kafka_producev (rd_kafka_t *rk, ...) {
                         break;
 
                 case RD_KAFKA_VTYPE_RKT:
-                        app_rkt = va_arg(ap, rd_kafka_topic_t *);
-                        rkt = rd_kafka_topic_keep(app_rkt);
+                        rkt = rd_kafka_topic_proper(
+                                va_arg(ap, rd_kafka_topic_t *));
+                        rd_kafka_topic_keep(rkt);
                         break;
 
                 case RD_KAFKA_VTYPE_PARTITION:
@@ -505,11 +723,11 @@ int rd_kafka_produce_batch (rd_kafka_topic_t *app_rkt, int32_t partition,
         int multiple_partitions = (partition == RD_KAFKA_PARTITION_UA ||
                                    (msgflags & RD_KAFKA_MSG_F_PARTITION));
         rd_kafka_resp_err_t all_err;
-        rd_kafka_topic_t *rkt = app_rkt;
+        rd_kafka_topic_t *rkt = rd_kafka_topic_proper(app_rkt);
         rd_kafka_toppar_t *rktp = NULL;
 
         /* Propagated per-message below */
-        all_err = rd_kafka_check_produce(rkt->rkt_rk);
+        all_err = rd_kafka_check_produce(rkt->rkt_rk, NULL);
 
         rd_kafka_topic_rdlock(rkt);
         if (!multiple_partitions) {
@@ -774,12 +992,13 @@ void rd_kafka_msgq_split (rd_kafka_msgq_t *leftq, rd_kafka_msgq_t *rightq,
 /**
  * @brief Set per-message metadata for all messages in \p rkmq
  */
-void rd_kafka_msgq_set_metadata (rd_kafka_msgq_t *rkmq,
+void rd_kafka_msgq_set_metadata (rd_kafka_msgq_t *rkmq, int32_t broker_id,
                                  int64_t base_offset, int64_t timestamp,
                                  rd_kafka_msg_status_t status) {
         rd_kafka_msg_t *rkm;
 
         TAILQ_FOREACH(rkm, &rkmq->rkmq_msgs, rkm_link) {
+                rkm->rkm_broker_id = broker_id;
                 rkm->rkm_offset = base_offset++;
                 if (timestamp != -1) {
                         rkm->rkm_timestamp = timestamp;
@@ -864,8 +1083,7 @@ int32_t rd_kafka_msg_partitioner_consistent_random (const rd_kafka_topic_t *rkt,
                                                  msg_opaque);
 }
 
-int32_t
-rd_kafka_msg_partitioner_murmur2 (const rd_kafka_topic_t *rkt,
+int32_t rd_kafka_msg_partitioner_murmur2 (const rd_kafka_topic_t *rkt,
                                   const void *key, size_t keylen,
                                   int32_t partition_cnt,
                                   void *rkt_opaque,
@@ -913,6 +1131,32 @@ int32_t rd_kafka_msg_partitioner_fnv1a_random (const rd_kafka_topic_t *rkt,
                 return rd_fnv1a(key, keylen) % partition_cnt;
 }
 
+int32_t rd_kafka_msg_sticky_partition (rd_kafka_topic_t *rkt,
+                                       const void *key, size_t keylen,
+                                       int32_t partition_cnt,
+                                       void *rkt_opaque,
+                                       void *msg_opaque) {
+
+        if (!rd_kafka_topic_partition_available(rkt, rkt->rkt_sticky_partition))
+                rd_interval_expedite(&rkt->rkt_sticky_intvl, 0);
+
+        if (rd_interval(&rkt->rkt_sticky_intvl,
+                        rkt->rkt_rk->rk_conf.sticky_partition_linger_ms * 1000,
+                        0) > 0) {
+                rkt->rkt_sticky_partition =
+                        rd_kafka_msg_partitioner_random(rkt,
+                                                        key,
+                                                        keylen,
+                                                        partition_cnt,
+                                                        rkt_opaque,
+                                                        msg_opaque);
+                rd_kafka_dbg(rkt->rkt_rk, TOPIC, "PARTITIONER",
+                             "%s [%"PRId32"] is the new sticky partition",
+                             rkt->rkt_topic->str, rkt->rkt_sticky_partition);
+        }
+
+        return rkt->rkt_sticky_partition;
+}
 
 /**
  * @brief Assigns a message to a topic partition using a partitioner.
@@ -951,6 +1195,14 @@ int rd_kafka_msg_partitioner (rd_kafka_topic_t *rkt, rd_kafka_msg_t *rkm,
 			rd_kafka_topic_rdunlock(rkt);
                 return err;
 
+        case RD_KAFKA_TOPIC_S_ERROR:
+                /* Topic has permanent error.
+                 * Fail message immediately. */
+                err = rkt->rkt_err;
+                if (do_lock)
+                        rd_kafka_topic_rdunlock(rkt);
+                return err;
+
         case RD_KAFKA_TOPIC_S_EXISTS:
                 /* Topic exists in cluster. */
 
@@ -964,13 +1216,29 @@ int rd_kafka_msg_partitioner (rd_kafka_topic_t *rkt, rd_kafka_msg_t *rkm,
 
                 /* Partition not assigned, run partitioner. */
                 if (rkm->rkm_partition == RD_KAFKA_PARTITION_UA) {
-                        partition = rkt->rkt_conf.
-                                partitioner(rkt,
-                                            rkm->rkm_key,
-					    rkm->rkm_key_len,
-                                            rkt->rkt_partition_cnt,
-                                            rkt->rkt_conf.opaque,
-                                            rkm->rkm_opaque);
+
+                        if (!rkt->rkt_conf.random_partitioner &&
+                            (!rkm->rkm_key ||
+                             (rkm->rkm_key_len == 0 &&
+                              rkt->rkt_conf.partitioner ==
+                              rd_kafka_msg_partitioner_consistent_random))) {
+                                partition =
+                                        rd_kafka_msg_sticky_partition(
+                                                rkt,
+                                                rkm->rkm_key,
+                                                rkm->rkm_key_len,
+                                                rkt->rkt_partition_cnt,
+                                                rkt->rkt_conf.opaque,
+                                                rkm->rkm_opaque);
+                        } else {
+                                partition = rkt->rkt_conf.
+                                        partitioner(rkt,
+                                                    rkm->rkm_key,
+                                                    rkm->rkm_key_len,
+                                                    rkt->rkt_partition_cnt,
+                                                    rkt->rkt_conf.opaque,
+                                                    rkm->rkm_opaque);
+                        }
                 } else
                         partition = rkm->rkm_partition;
 
@@ -1045,6 +1313,8 @@ void rd_kafka_message_destroy (rd_kafka_message_t *rkmessage) {
 
 rd_kafka_message_t *rd_kafka_message_new (void) {
         rd_kafka_msg_t *rkm = rd_calloc(1, sizeof(*rkm));
+        rkm->rkm_flags      = RD_KAFKA_MSG_F_FREE_RKM;
+        rkm->rkm_broker_id  = -1;
         return (rd_kafka_message_t *)rkm;
 }
 
@@ -1174,6 +1444,15 @@ int64_t rd_kafka_message_latency (const rd_kafka_message_t *rkmessage) {
                 return -1;
 
         return rd_clock() - rkm->rkm_ts_enq;
+}
+
+
+int32_t rd_kafka_message_broker_id (const rd_kafka_message_t *rkmessage) {
+        rd_kafka_msg_t *rkm;
+
+        rkm = rd_kafka_message2msg((rd_kafka_message_t *)rkmessage);
+
+        return rkm->rkm_broker_id;
 }
 
 
@@ -1355,12 +1634,11 @@ void rd_kafka_msgbatch_destroy (rd_kafka_msgbatch_t *rkmb) {
 
 /**
  * @brief Initialize a message batch for the Idempotent Producer.
- *
- * @param rkm is the first message in the batch.
  */
 void rd_kafka_msgbatch_init (rd_kafka_msgbatch_t *rkmb,
                              rd_kafka_toppar_t *rktp,
-                             rd_kafka_pid_t pid) {
+                             rd_kafka_pid_t pid,
+                             uint64_t epoch_base_msgid) {
         memset(rkmb, 0, sizeof(*rkmb));
 
         rkmb->rktp = rd_kafka_toppar_keep(rktp);
@@ -1369,12 +1647,15 @@ void rd_kafka_msgbatch_init (rd_kafka_msgbatch_t *rkmb,
 
         rkmb->pid = pid;
         rkmb->first_seq = -1;
+        rkmb->epoch_base_msgid = epoch_base_msgid;
 }
 
 
 /**
  * @brief Set the first message in the batch. which is used to set
  *        the BaseSequence and keep track of batch reconstruction range.
+ *
+ * @param rkm is the first message in the batch.
  */
 void rd_kafka_msgbatch_set_first_msg (rd_kafka_msgbatch_t *rkmb,
                                       rd_kafka_msg_t *rkm) {
@@ -1388,9 +1669,8 @@ void rd_kafka_msgbatch_set_first_msg (rd_kafka_msgbatch_t *rkmb,
         /* Our msgid counter is 64-bits, but the
          * Kafka protocol's sequence is only 31 (signed), so we'll
          * need to handle wrapping. */
-        rkmb->first_seq =
-                rd_kafka_seq_wrap(rkm->rkm_u.producer.msgid -
-                                  rkmb->rktp->rktp_eos.epoch_base_msgid);
+        rkmb->first_seq = rd_kafka_seq_wrap(rkm->rkm_u.producer.msgid -
+                                            rkmb->epoch_base_msgid);
 
         /* Check if there is a stored last message
          * on the first msg, which means an entire

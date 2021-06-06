@@ -100,6 +100,8 @@ typedef struct rd_kafka_msg_s {
                                            *   the ProduceResponse handler:
                                            *   this value is always up to date.
                                            */
+        int32_t rkm_broker_id;            /**< Broker message was produced to
+                                           *   or fetched from. */
 
         union {
                 struct {
@@ -148,7 +150,7 @@ size_t rd_kafka_msg_wire_size (const rd_kafka_msg_t *rkm, int MsgVersion) {
         static const size_t overheads[] = {
                 [0] = RD_KAFKAP_MESSAGE_V0_OVERHEAD,
                 [1] = RD_KAFKAP_MESSAGE_V1_OVERHEAD,
-                [2] = RD_KAFKAP_MESSAGE_V2_OVERHEAD
+                [2] = RD_KAFKAP_MESSAGE_V2_MAX_OVERHEAD
         };
         size_t size;
         rd_dassert(MsgVersion >= 0 && MsgVersion <= 2);
@@ -170,7 +172,7 @@ size_t rd_kafka_msg_wire_size (const rd_kafka_msg_t *rkm, int MsgVersion) {
 static RD_INLINE RD_UNUSED
 size_t rd_kafka_msg_max_wire_size (size_t keylen, size_t valuelen,
                                    size_t hdrslen) {
-        return RD_KAFKAP_MESSAGE_V2_OVERHEAD +
+        return RD_KAFKAP_MESSAGE_V2_MAX_OVERHEAD +
                 keylen + valuelen + hdrslen;
 }
 
@@ -494,7 +496,7 @@ rd_kafka_msg_t *rd_kafka_msgq_find_pos (const rd_kafka_msgq_t *rkmq,
                                                     const void *),
                                         int *cntp, int64_t *bytesp);
 
-void rd_kafka_msgq_set_metadata (rd_kafka_msgq_t *rkmq,
+void rd_kafka_msgq_set_metadata (rd_kafka_msgq_t *rkmq, int32_t broker_id,
                                  int64_t base_offset, int64_t timestamp,
                                  rd_kafka_msg_status_t status);
 
